@@ -84,6 +84,7 @@ The remaining keys are ordinary capture settings:
 | `jpegQuality` | `70` | JPEG quality |
 | `codec` | `h264` | frame storage: `h264` (in-memory segments, ~445 MB per 20 min) or `jpeg` (per-frame files, 6–11 GB) |
 | `captureDir` | `''` | frame output directory; empty means the helper's own temp directory |
+| `recordDir` | `''` | **recording** directory (Windows path). When set, every `screen_watch start` also encodes the captured frames straight into an mp4 in this directory — one continuous encoder, timestamps taken from the real capture instants, so a fluctuating capture rate does not compress playback. Measured at 2560×1440: ~1.1 MB per 5 s, versus ~631 MB for the same span written as per-frame JPEG. Recording implies `h264`. Empty means no recording. |
 | `helperPath` | `''` | helper executable; empty means the bundled `helper/CuHelper.exe` |
 
 The plugin's own code defaults differ for `backend` (`gdi`) and `codec` (`jpeg`): the patch file is where a

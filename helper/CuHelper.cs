@@ -31,9 +31,13 @@ internal static class CuHelper
     [DllImport("kernel32.dll")] private static extern bool QueryPerformanceFrequency(out long value);
     [DllImport("shcore.dll")] private static extern int SetProcessDpiAwareness(int value);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    /// <summary>虚拟键 ↔ 扫描码换算；MAPVK_VK_TO_VSC = 0。</summary>
+    [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+    [DllImport("imm32.dll")] private static extern IntPtr ImmGetDefaultIMEWnd(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowProc callback, IntPtr param);
@@ -102,6 +106,8 @@ internal static class CuHelper
     private const uint MOUSEEVENTF_HWHEEL = 0x1000;
     private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+    private const int WM_IME_CONTROL = 0x0283;
+    private const int IMC_GETOPENSTATUS = 5;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
     private const uint WHEEL_DELTA = 120;
@@ -297,6 +303,34 @@ internal static class CuHelper
             throw new InvalidOperationException("SendInput 拒绝了鼠标事件");
     }
 
+    // 最近一次 SendInput 的结果：回执带上"注入了几条事件 + 失败时的 GetLastError"，才能区分
+    // 「根本没注入」与「注入了但没人响应」——2026-09-22 排查 VK 通道失效时就卡在这个分辨力上。
+    private static uint lastInjectCount;
+    private static int lastInjectError;
+
+    /// <summary>虚拟键 → 物理扫描码；换算不出来时返回 0。</summary>
+    private static ushort ScanCode(ushort vk)
+    {
+        return (ushort)(MapVirtualKey(vk, 0) & 0xFF);
+    }
+
+    /// <summary>
+    /// 前台窗口的输入法是否开着（1 = 中文/组合态，0 = 直通/英文，-1 = 查不到）。
+    ///
+    /// 为什么键盘回执要带它：IME 开着时，合成注入的**字母键与方向键会被输入法截获**去做拼音组合，
+    /// 目标窗口只收得到 keyup、收不到 keydown（2026-09-22 用记录 keydown 序列的探针页面实测）——
+    /// 表现与"按键根本没注入"极像，而补救动作完全不同。带上它才能一眼分辨。
+    /// </summary>
+    private static int ImeOpenStatus()
+    {
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero) return -1;
+        IntPtr ime = ImmGetDefaultIMEWnd(hwnd);
+        if (ime == IntPtr.Zero) return -1;
+        IntPtr result = SendMessage(ime, WM_IME_CONTROL, (IntPtr)IMC_GETOPENSTATUS, IntPtr.Zero);
+        return result.ToInt32();
+    }
+
     private static void SendKeyRaw(ushort vk, ushort scan, uint flags)
     {
         INPUT[] inputs = new INPUT[1];
@@ -306,8 +340,10 @@ internal static class CuHelper
         inputs[0].data.keyboard.dwFlags = flags;
         inputs[0].data.keyboard.time = 0;
         inputs[0].data.keyboard.dwExtraInfo = IntPtr.Zero;
-        if (SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT))) != 1)
-            throw new InvalidOperationException("SendInput 拒绝了键盘事件（目标窗口可能以更高权限运行）");
+        lastInjectCount = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+        lastInjectError = lastInjectCount == 1 ? 0 : Marshal.GetLastWin32Error();
+        if (lastInjectCount != 1)
+            throw new InvalidOperationException("SendInput 拒绝了键盘事件（winerr=" + lastInjectError + "）");
     }
 
     private static readonly System.Collections.Generic.Dictionary<string, ushort> KeyTable = BuildKeyTable();
@@ -518,6 +554,12 @@ internal static class CuHelper
 
     private static string MouseButton(string button, string action, int count)
     {
+        // 落点必须在**注入之前**读：`click` 不移动光标，用的就是当时那个位置。
+        // 注入之后再读没有意义——**光标是全局唯一资源**，别的会话（或用户本人）一次 mouse_move
+        // 就能把它挪走，那时读到的位置不能证明"点在哪"（2026-09-22 千瞳指出：并发时该字段
+        // 会被当成落点验证，属误导）。
+        POINT landed;
+        bool hasLanded = GetCursorPos(out landed);
         double before = Now();
         if (action == "down") SendMouse(ButtonFlag(button, true), 0, 0, 0);
         else if (action == "up") SendMouse(ButtonFlag(button, false), 0, 0, 0);
@@ -531,14 +573,17 @@ internal static class CuHelper
             }
         }
         double after = Now();
-        // 回执：点在**哪里**、那一点上是**哪个窗口**。鼠标合成点击对某些窗口无效（原生模态框、
-        // 以更高权限运行的窗口），有了这两项才能立刻分辨"点空了"与"被目标忽略了"，
-        // 而不是再截一张图猜（那是 3–6 秒）。
-        POINT point;
+        // 回执：点在**哪里**（`x_landed`/`y_landed`，注入前读）、那一点上是**哪个窗口**。
+        // 鼠标合成点击对某些窗口无效（原生模态框、以更高权限运行的窗口），有这两项才能立刻分辨
+        // "点空了"与"被目标忽略了"，而不是再截一张图猜（那是 3–6 秒）。
+        // `x_after`/`y_after` 保留，但语义**只是"读回这一刻光标在哪"**，不能当落点验证。
         string hit = "";
+        if (hasLanded)
+            hit = ",\"x_landed\":" + landed.X + ",\"y_landed\":" + landed.Y
+                + ",\"window\":" + WindowUnder(landed.X, landed.Y);
+        POINT point;
         if (GetCursorPos(out point))
-            hit = ",\"x_after\":" + point.X + ",\"y_after\":" + point.Y
-                + ",\"window\":" + WindowUnder(point.X, point.Y);
+            hit += ",\"x_after\":" + point.X + ",\"y_after\":" + point.Y;
         return "{\"ok\":true,\"button\":\"" + Esc(button) + "\",\"action\":\"" + Esc(action) + "\""
             + hit + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(after) + "}";
     }
@@ -581,20 +626,49 @@ internal static class CuHelper
             + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(Now()) + "}";
     }
 
-    private static string KeyEvent(string name, string action)
+    private static string KeyEvent(string name, string action, int holdMs)
     {
         ushort vk = ResolveKey(name);
+        // 扫描码必须一起给：浏览器 canvas 与游戏常按物理扫描码取值，wScan=0 的注入会被它们忽略
+        // （2026-09-22：同一时刻 type_text 有效而 press_key 全灭，分叉点就在这条通道）。
+        ushort scan = ScanCode(vk);
         uint extended = IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0;
+        int imeOpen = ImeOpenStatus();
         double before = Now();
-        if (action == "down") SendKeyRaw(vk, 0, extended);
-        else if (action == "up") SendKeyRaw(vk, 0, extended | KEYEVENTF_KEYUP);
+        bool press = action != "down" && action != "up";
+        int downCount = 0;
+        int upCount = 0;
+        if (action == "down")
+        {
+            SendKeyRaw(vk, scan, extended);
+            downCount = (int)lastInjectCount;
+        }
+        else if (action == "up")
+        {
+            SendKeyRaw(vk, scan, extended | KEYEVENTF_KEYUP);
+            upCount = (int)lastInjectCount;
+        }
         else
         {
-            SendKeyRaw(vk, 0, extended);
-            SendKeyRaw(vk, 0, extended | KEYEVENTF_KEYUP);
+            // 按下与抬起之间必须留一点时间：零间隔的 down+up 会被按 requestAnimationFrame 轮询按键状态的页面
+            // 整帧错过（2026-09-22 评测页 C2 Sky Hop 同页对照：press_key 零响应 injected 全绿，
+            // 而 key_state down → wait(80) → up 立即生效）。人类点击的按下时长本就在 50~100ms 量级，
+            // 所以默认 50ms 不改变"点一下"的语义；需要严格零间隔的调用方显式传 holdMs=0。
+            SendKeyRaw(vk, scan, extended);
+            downCount = (int)lastInjectCount;
+            if (holdMs > 0) Thread.Sleep(holdMs);
+            SendKeyRaw(vk, scan, extended | KEYEVENTF_KEYUP);
+            upCount = (int)lastInjectCount;
         }
         return "{\"ok\":true,\"key\":\"" + Esc(name) + "\",\"action\":\"" + Esc(action) + "\""
-            + ",\"vk\":" + vk + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(Now()) + "}";
+            + ",\"vk\":" + vk + ",\"scan\":" + scan
+            // injected 是**本次事件总数**（旧版误用"最后一次 SendInput 的返回值"，恒为 1，
+            // 让人把"回执全绿"读成"注入完整"）；events 再给出 down/up 各几个。
+            + ",\"injected\":" + (downCount + upCount)
+            + ",\"events\":{\"down\":" + downCount + ",\"up\":" + upCount + "}"
+            + ",\"hold_ms\":" + (press ? holdMs : 0)
+            + ",\"winerr\":" + lastInjectError + ",\"ime_open\":" + imeOpen
+            + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(Now()) + "}";
     }
 
     /// <summary>组合键：按顺序按下、再逆序抬起，保证修饰键在按键期间保持按住。</summary>
@@ -602,13 +676,32 @@ internal static class CuHelper
     {
         if (keys.Length == 0) throw new InvalidOperationException("hotkey 需要至少一个键");
         ushort[] vks = new ushort[keys.Length];
-        for (int i = 0; i < keys.Length; i++) vks[i] = ResolveKey(keys[i]);
+        ushort[] scans = new ushort[keys.Length];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            vks[i] = ResolveKey(keys[i]);
+            scans[i] = ScanCode(vks[i]);
+        }
         double before = Now();
+        int imeOpen = ImeOpenStatus();
+        uint injected = 0;
         for (int i = 0; i < vks.Length; i++)
-            SendKeyRaw(vks[i], 0, (IsExtendedKey(vks[i]) ? KEYEVENTF_EXTENDEDKEY : 0));
+        {
+            SendKeyRaw(vks[i], scans[i], (IsExtendedKey(vks[i]) ? KEYEVENTF_EXTENDEDKEY : 0));
+            injected += lastInjectCount;
+        }
         for (int i = vks.Length - 1; i >= 0; i--)
-            SendKeyRaw(vks[i], 0, (IsExtendedKey(vks[i]) ? KEYEVENTF_EXTENDEDKEY : 0) | KEYEVENTF_KEYUP);
+        {
+            SendKeyRaw(vks[i], scans[i], (IsExtendedKey(vks[i]) ? KEYEVENTF_EXTENDEDKEY : 0) | KEYEVENTF_KEYUP);
+            injected += lastInjectCount;
+        }
         return "{\"ok\":true,\"keys\":\"" + Esc(string.Join("+", keys)) + "\""
+            + ",\"injected\":" + injected
+            // 与 key 命令对齐：events 给出 down/up 各几个（千瞳 2026-09-22 的第 ③ 条验收要求：
+            // 加了保持时长后要能从回执看出"注入了哪些事件、各几个"）。
+            + ",\"events\":{\"down\":" + vks.Length + ",\"up\":" + vks.Length + "}"
+            + ",\"winerr\":" + lastInjectError
+            + ",\"ime_open\":" + imeOpen
             + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(Now()) + "}";
     }
 
@@ -619,14 +712,19 @@ internal static class CuHelper
     private static string TypeText(string text)
     {
         if (text == null) text = "";
+        int imeOpen = ImeOpenStatus();
         double before = Now();
+        uint injected = 0;
         for (int i = 0; i < text.Length; i++)
         {
             ushort unit = text[i];
             SendKeyRaw(0, unit, KEYEVENTF_UNICODE);
+            injected += lastInjectCount;
             SendKeyRaw(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+            injected += lastInjectCount;
         }
-        return "{\"ok\":true,\"chars\":" + text.Length
+        return "{\"ok\":true,\"chars\":" + text.Length + ",\"injected\":" + injected
+            + ",\"winerr\":" + lastInjectError + ",\"ime_open\":" + imeOpen
             + ",\"t_before\":" + F(before) + ",\"t_after\":" + F(Now()) + "}";
     }
 
@@ -655,6 +753,13 @@ internal static class CuHelper
     private static int liveCapacity = 1800;   // 30 fps × 60 s
     private static double liveStart;
     private static int liveCount;
+    // 录像（可选）：采集帧**直接编码写入 mp4 文件**，用一个连续编码器 —— 见 FileEncoder 的注释。
+    // 它替代"jpeg 逐帧落盘再事后合成"：同分辨率下 CPU 与内存切片相当，却省掉每帧一个文件的开销。
+    private static string liveRecordPath = "";
+    private static FileEncoder liveRecorder;
+    private static double liveRecordStart;
+    private static int liveRecordFrames;
+    private static string liveRecordError = "";
 
     private class PendingFrame
     {
@@ -863,18 +968,25 @@ internal static class CuHelper
     }
 
     private static string LiveStart(int intervalMs, int quality, int capacity, string backend,
-        string codec, int segmentFrames, double retainSeconds)
+        string codec, int segmentFrames, double retainSeconds, string recordPath)
     {
         if (liveRunning) return "{\"ok\":true,\"already\":true,\"interval_ms\":" + liveIntervalMs + "}";
         if (backend == "dxgi" || backend == "gdi") liveBackend = backend;
         if (codec == "h264" || codec == "jpeg") liveCodec = codec;
+        // 录像要求给定 record_path；编码器只存在于 h264 路径，所以带录像时强制走 h264。
+        liveRecordPath = recordPath == null ? "" : recordPath;
+        if (liveRecordPath.Length > 0) liveCodec = "h264";
+        liveRecordFrames = 0;
+        liveRecordError = "";
         if (segmentFrames > 0) h264SegmentFrames = segmentFrames;
         if (retainSeconds > 0) h264RetainSeconds = retainSeconds;
         if (intervalMs > 0) liveIntervalMs = intervalMs;
         if (quality > 0) liveQuality = quality;
         if (capacity > 0) liveCapacity = capacity;
         lock (ringLock) { ring.Clear(); }
-        lock (h264Lock) { h264Ring.Clear(); h264TotalBytes = 0; h264SegmentCount = 0; h264LastSeconds = 0; }
+        lock (h264Lock) { h264Ring.Clear(); h264TotalBytes = 0; h264SegmentCount = 0; h264LastSeconds = 0; h264SealedUntil = Now(); }
+        h264FlushRequested = false;
+        h264LastFlushAt = 0;
         liveStart = Now();
         liveCount = 0;
         liveRunning = true;
@@ -890,7 +1002,8 @@ internal static class CuHelper
         liveThread.Start();
         return "{\"ok\":true,\"interval_ms\":" + liveIntervalMs + ",\"quality\":" + liveQuality
             + ",\"capacity\":" + liveCapacity + ",\"backend\":\"" + liveBackend + "\""
-            + ",\"codec\":\"" + liveCodec + "\",\"segment_frames\":" + h264SegmentFrames + "}";
+            + ",\"codec\":\"" + liveCodec + "\",\"segment_frames\":" + h264SegmentFrames
+            + ",\"record_path\":\"" + Esc(liveRecordPath) + "\"}";
     }
 
     private static string LiveStop()
@@ -911,15 +1024,19 @@ internal static class CuHelper
             encodeThread = null;
         }
         liveQueue = null;
-        return "{\"ok\":true,\"frames\":" + liveCount + "}";
+        // 录像线程已在 LiveLoopH264 的 finally 里 Finish + Dispose（stop 前已经 Join 过采集线程）。
+        return "{\"ok\":true,\"frames\":" + liveCount
+            + ",\"record_path\":\"" + Esc(liveRecordPath) + "\",\"record_frames\":" + liveRecordFrames
+            + ",\"record_error\":\"" + Esc(liveRecordError) + "\"}";
     }
 
     private static string Latest()
     {
-        // h264 模式不写逐帧帧表：最新可用画面是最后一片的末尾（正在写的那片还没封，取不到），
-        // 调用方拿这个时刻往前推窗口，才不会去要一段还没有封片、注定取不到的时间。
+        // h264 模式不写逐帧帧表：最新可用画面是最后一片的末尾。**先把正在写的那片结算掉**，
+        // 否则"最近可用画面"实际是 5 秒前的画面，调用方据此往前推窗口会白白错过刚发生的事。
         if (liveCodec == "h264")
         {
+            RequestH264Seal();
             H264Slice slice = null;
             lock (h264Lock) { if (h264Ring.Count > 0) slice = h264Ring[h264Ring.Count - 1]; }
             if (slice == null) return "{\"ok\":false,\"error\":\"采集未启动或还没有封好的切片\"}";
@@ -942,6 +1059,7 @@ internal static class CuHelper
             for (int i = 0; i < count; i++) bytes += ring[i].bytes;
         }
         int segments; long h264Bytes; double retained = 0;
+        double sealedUntil = 0;
         lock (h264Lock)
         {
             // 口径必须与 frames/bytes 一致：三者描述的都是**环里现存**的东西。
@@ -951,6 +1069,15 @@ internal static class CuHelper
             h264Bytes = h264TotalBytes;
             // retained_s 才是"现在还能回看多久"：现存片覆盖的真实时长（首片起点 → 末片终点）。
             if (liveCodec == "h264" && segments > 0) retained = h264Ring[segments - 1].End - h264Ring[0].Start;
+            sealedUntil = h264SealedUntil;
+        }
+        // 未封片窗口：最后一片封片之后积了多少秒。这段时间的画面默认取不到，除非取帧时按需结算
+        // （见 RequestH264Seal）——所以它必须报出来，让调用方知道"再等一下或直接取都会拿到"。
+        double unsealed = 0;
+        if (liveRunning && liveCodec == "h264")
+        {
+            unsealed = Now() - sealedUntil;
+            if (unsealed < 0) unsealed = 0;
         }
         if (liveCodec == "h264")
         {
@@ -983,8 +1110,11 @@ internal static class CuHelper
             + ",\"capacity\":" + liveCapacity
             + ",\"segments\":" + segments + ",\"segments_total\":" + h264SegmentCount
             + ",\"retained_s\":" + F(retained)
+            + ",\"unsealed_s\":" + F(unsealed)
             + ",\"segment_frames\":" + h264SegmentFrames
-            + ",\"retain_s\":" + F(h264RetainSeconds) + "}";
+            + ",\"retain_s\":" + F(h264RetainSeconds)
+            + ",\"record_path\":\"" + Esc(liveRecordPath) + "\",\"record_frames\":" + liveRecordFrames
+            + ",\"record_error\":\"" + Esc(liveRecordError) + "\"}";
     }
 
     /// <summary>按帧时间戳区间取帧（回看用）。limit 限制返回条数，避免一次吐出整段缓冲。</summary>
@@ -1014,14 +1144,211 @@ internal static class CuHelper
         return builder.ToString();
     }
 
+    /// <summary>
+    /// 变化检测：把窗口内的帧两两相邻差分，直接报出"哪些矩形区域变了、在什么时候变的"。
+    ///
+    /// 为什么值得一条单独的命令：插件侧（Node）拿不到像素，"画面变没变、变在哪"只能靠反复取帧
+    /// 再让模型比对——那是每轮几秒的观察成本。这里让 helper 用像素算出结论。
+    ///
+    /// 复用 `FramesIn` 的取帧路径（逐帧 JPEG 直接给环内文件；H.264 解码时已落盘），所以两种存储
+    /// 编码都支持；帧文件若已被环形清理就跳过那一对，如实少报、不猜。
+    /// </summary>
+    private static string DiffFrames(double from, double to, int limit, int cell, double ratio, int maxBoxes)
+    {
+        System.Collections.Generic.List<double> times = new System.Collections.Generic.List<double>();
+        System.Collections.Generic.List<string> paths = new System.Collections.Generic.List<string>();
+        CollectFrameFiles(from, to, limit, times, paths);
+        if (times.Count < 2)
+            return "{\"ok\":true,\"frames\":" + times.Count + ",\"cell\":" + cell + ",\"changes\":[]}";
+
+        StringBuilder builder = new StringBuilder();
+        builder.Append("{\"ok\":true,\"frames\":").Append(times.Count)
+            .Append(",\"cell\":").Append(cell).Append(",\"changes\":[");
+        int pairs = 0;
+        for (int i = 1; i < times.Count; i++)
+        {
+            Bitmap before = null;
+            Bitmap after = null;
+            try
+            {
+                before = new Bitmap(paths[i - 1]);
+                after = new Bitmap(paths[i]);
+            }
+            catch
+            {
+                // 帧文件可能已被清理：跳过这一对，别把"读不到"说成"没变化"。
+                if (before != null) before.Dispose();
+                if (after != null) after.Dispose();
+                continue;
+            }
+            string boxes = DiffBoxes(before, after, cell, ratio, maxBoxes);
+            before.Dispose();
+            after.Dispose();
+            if (pairs > 0) builder.Append(',');
+            builder.Append("{\"t_from\":").Append(F(times[i - 1]))
+                .Append(",\"t_to\":").Append(F(times[i]))
+                .Append(",\"boxes\":").Append(boxes).Append('}');
+            pairs++;
+        }
+        builder.Append("]}");
+        return builder.ToString();
+    }
+
+    /// <summary>取出窗口内的帧文件与时刻：逐帧 JPEG 走环内记录；H.264 走解码落盘后的同构 JSON。</summary>
+    private static void CollectFrameFiles(double from, double to, int limit,
+        System.Collections.Generic.List<double> times, System.Collections.Generic.List<string> paths)
+    {
+        if (liveCodec == "h264")
+        {
+            string json = H264FramesIn(from, to, limit);
+            int index = 0;
+            while (true)
+            {
+                int timeAt = json.IndexOf("\"t\":", index, StringComparison.Ordinal);
+                if (timeAt < 0) break;
+                int timeStart = timeAt + 4;
+                int timeEnd = json.IndexOf(',', timeStart);
+                if (timeEnd < 0) break;
+                double moment;
+                if (!double.TryParse(json.Substring(timeStart, timeEnd - timeStart), NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out moment)) break;
+                int pathAt = json.IndexOf("\"path\":\"", timeEnd, StringComparison.Ordinal);
+                if (pathAt < 0) break;
+                int pathStart = pathAt + 8;
+                int pathEnd = json.IndexOf('"', pathStart);
+                if (pathEnd < 0) break;
+                times.Add(moment);
+                paths.Add(json.Substring(pathStart, pathEnd - pathStart));
+                index = pathEnd;
+            }
+            return;
+        }
+        lock (ringLock)
+        {
+            for (int i = 0; i < ring.Count; i++)
+            {
+                if (ring[i].t < from) continue;
+                if (ring[i].t > to) break;
+                times.Add(ring[i].t);
+                paths.Add(ring[i].path);
+                if (times.Count >= limit) break;
+            }
+        }
+    }
+
+    /// <summary>逐像素差分 → 单元网格比例 → 合并矩形（像素坐标，与屏幕坐标同口径）。</summary>
+    private static string DiffBoxes(Bitmap before, Bitmap after, int cell, double ratio, int maxBoxes)
+    {
+        int width = before.Width;
+        int height = before.Height;
+        if (after.Width != width || after.Height != height) return "[]";
+        Rectangle rect = new Rectangle(0, 0, width, height);
+        BitmapData dataBefore = before.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        BitmapData dataAfter = after.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        int[] pixelsBefore = new int[width * height];
+        int[] pixelsAfter = new int[width * height];
+        Marshal.Copy(dataBefore.Scan0, pixelsBefore, 0, pixelsBefore.Length);
+        Marshal.Copy(dataAfter.Scan0, pixelsAfter, 0, pixelsAfter.Length);
+        before.UnlockBits(dataBefore);
+        after.UnlockBits(dataAfter);
+
+        int cols = (width + cell - 1) / cell;
+        int rows = (height + cell - 1) / cell;
+        int[] changed = new int[cols * rows];
+        int[] totals = new int[cols * rows];
+        for (int y = 0; y < height; y++)
+        {
+            int rowBase = y * width;
+            int rowCell = (y / cell) * cols;
+            for (int x = 0; x < width; x++)
+            {
+                int cellIndex = rowCell + x / cell;
+                totals[cellIndex]++;
+                int a = pixelsBefore[rowBase + x];
+                int b = pixelsAfter[rowBase + x];
+                int delta = Math.Abs(((a >> 16) & 0xFF) - ((b >> 16) & 0xFF))
+                    + Math.Abs(((a >> 8) & 0xFF) - ((b >> 8) & 0xFF))
+                    + Math.Abs((a & 0xFF) - (b & 0xFF));
+                // 三通道差之和超过 60（每通道平均 20）才算真变化：JPEG 噪声远低于它。
+                if (delta > 60) changed[cellIndex]++;
+            }
+        }
+
+        bool[] hot = new bool[cols * rows];
+        for (int i = 0; i < hot.Length; i++)
+            hot[i] = totals[i] > 0 && (double)changed[i] / totals[i] >= ratio;
+
+        System.Collections.Generic.List<int[]> boxes = MergeBoxes(hot, cols, rows);
+        boxes.Sort(delegate(int[] left, int[] right)
+        {
+            int leftArea = (left[2] - left[0] + 1) * (left[3] - left[1] + 1);
+            int rightArea = (right[2] - right[0] + 1) * (right[3] - right[1] + 1);
+            return rightArea.CompareTo(leftArea);
+        });
+
+        StringBuilder builder = new StringBuilder("[");
+        int emitted = 0;
+        for (int i = 0; i < boxes.Count && emitted < maxBoxes; i++)
+        {
+            int[] box = boxes[i];
+            if (emitted > 0) builder.Append(',');
+            int left = box[0] * cell;
+            int top = box[1] * cell;
+            builder.Append("{\"x\":").Append(left)
+                .Append(",\"y\":").Append(top)
+                .Append(",\"w\":").Append(Math.Min(width, (box[2] + 1) * cell) - left)
+                .Append(",\"h\":").Append(Math.Min(height, (box[3] + 1) * cell) - top)
+                .Append('}');
+            emitted++;
+        }
+        builder.Append(']');
+        return builder.ToString();
+    }
+
+    /// <summary>把变化单元合并成矩形：从未访问的单元向右下贪心扩展到最大矩形（够用且实现简单）。</summary>
+    private static System.Collections.Generic.List<int[]> MergeBoxes(bool[] hot, int cols, int rows)
+    {
+        bool[] used = new bool[hot.Length];
+        System.Collections.Generic.List<int[]> boxes = new System.Collections.Generic.List<int[]>();
+        for (int row = 0; row < rows; row++)
+        {
+            for (int col = 0; col < cols; col++)
+            {
+                if (!hot[row * cols + col] || used[row * cols + col]) continue;
+                int right = col;
+                while (right + 1 < cols && hot[row * cols + right + 1] && !used[row * cols + right + 1]) right++;
+                int bottom = row;
+                while (bottom + 1 < rows)
+                {
+                    bool fits = true;
+                    for (int c = col; c <= right; c++)
+                    {
+                        if (!hot[(bottom + 1) * cols + c] || used[(bottom + 1) * cols + c]) { fits = false; break; }
+                    }
+                    if (!fits) break;
+                    bottom++;
+                }
+                for (int r = row; r <= bottom; r++)
+                    for (int c = col; c <= right; c++) used[r * cols + c] = true;
+                boxes.Add(new int[] { col, row, right, bottom });
+            }
+        }
+        return boxes;
+    }
+
     /// <summary>切片时间轴的名义帧率：MemoryEncoder.Write 按 30 fps 写片内时间戳，片内从 0 开始。</summary>
     private const double SliceFrameRate = 30.0;
 
-    /// <summary>一次 frames 调用最多解码多少帧。逐帧 JPEG 路径"取 512 帧"只是列文件名，
-    /// 而 H.264 的每一帧都要真解码（实测含落盘约 70–150 ms），照数解码会慢到几十秒。</summary>
-    private const int H264DecodeBudget = 24;
+    /// <summary>一次 frames 调用最多解码多少帧，与工具描述里的"上限 512 帧（≈17 秒 @30fps）"对齐。
+    /// 逐帧 JPEG 路径"取 512 帧"只是列文件名，而 H.264 的每一帧都要真解码（实测含落盘约 70–150 ms）
+    /// ⇒ 512 帧是几十秒量级的一次调用：调用方要按窗口长度决定要不要一次取这么宽
+    /// （1 秒窗口约 30 帧、约 3 秒完成，这才是取逐帧时刻表的常规用法）。</summary>
+    private const int H264DecodeBudget = 512;
 
     private static int h264TakenSeq;
+
+    /// <summary>预建编码器由后台线程写、采集线程读，用锁保证可见性。</summary>
+    private static readonly object pendingLock = new object();
 
     /// <summary>
     /// H.264 环形缓冲按时间戳取帧：定位相交切片 → 片内解码 → 落 JPEG → 返回与逐帧 JPEG
@@ -1032,11 +1359,15 @@ internal static class CuHelper
     ///     GDI 约 23–27 fps）⇒ 换算回真实时刻必须用片首片尾的采集时刻做线性映射；不校正的话
     ///     一片内最多差出 0.4 秒（GDI），"这一刻的画面"就会答错。
     ///   · 只覆盖**已封片**的部分：正在写的那一片不在环里，最近不到一个片长（5 秒）的画面取不到。
-    ///   · 窗口内均匀抽样，抽到的点数受 H264DecodeBudget 限制——不是"窗口内每一帧"。
+    ///   · 窗口内**每一帧**都作为目标；只有帧数超过 H264DecodeBudget（512）时才均匀抽样。
     /// </summary>
     private static string H264FramesIn(double from, double to, int limit)
     {
         EnsureMediaFoundation();
+        // 窗口若伸进"还在写的那一片"，先请采集线程结算一次再取——否则最近的画面永远取不到。
+        double sealedUntil;
+        lock (h264Lock) { sealedUntil = h264SealedUntil; }
+        if (to > sealedUntil + 0.05) RequestH264Seal();
         System.Collections.Generic.List<H264Slice> slices = new System.Collections.Generic.List<H264Slice>();
         lock (h264Lock)
         {
@@ -1050,67 +1381,63 @@ internal static class CuHelper
         }
         if (slices.Count == 0) return "{\"ok\":true,\"count\":0,\"frames\":[]}";
 
+        int n = slices.Count;
         int take = limit < H264DecodeBudget ? limit : H264DecodeBudget;
         if (take < 1) take = 1;
 
-        // 目标时刻**按片分配**，不是在整窗口上均匀铺开：窗口端点几乎不会正好落在某一片的
-        // Start/End 上，铺出来的点一旦落到所有片之外就被静默丢掉——实测请求 2 个点只回了 1 帧
-        // （那次窗口起点比第一片的 End 晚了几毫秒）。按片分配保证每个点都落在某片自己的区间里。
-        int n = slices.Count;
-        double[] lower = new double[n];
-        double[] upper = new double[n];
-        System.Collections.Generic.List<int> activeIdx = new System.Collections.Generic.List<int>();
-        double total = 0;
+        // 目标 = 窗口覆盖到的**每一帧**，时刻 = 片首 + 帧序号 × 片内步长（步长由片首片尾的真实时刻
+        // 校正）。早先按"片内均匀铺点"生成目标，配合 24 帧的解码预算，交付的是抽样——与工具描述
+        // 写的"返回窗口内每一帧"不符（2026-09-22 由评测方实测报出：任意窗口恒约 24 张）。
+        // 现在帧够少时就是字面意义的每一帧；超过 take 才均匀抽样，且抽样仍落在真实帧时刻上。
+        System.Collections.Generic.List<double> allTargets = new System.Collections.Generic.List<double>();
+        System.Collections.Generic.List<int> allSlice = new System.Collections.Generic.List<int>();
+        System.Collections.Generic.List<int> allFrame = new System.Collections.Generic.List<int>();
         for (int i = 0; i < n; i++)
         {
-            lower[i] = Math.Max(from, slices[i].Start);
-            upper[i] = Math.Min(to, slices[i].End);
-            if (upper[i] <= lower[i]) continue;
-            activeIdx.Add(i);
-            total += upper[i] - lower[i];
-        }
-        if (activeIdx.Count == 0) return "{\"ok\":true,\"count\":0,\"frames\":[]}";
-
-        int[] alloc = new int[n];
-        if (activeIdx.Count >= take)
-        {
-            // 片比点数还多：均匀挑 take 个片，每片一个点（落在该片与窗口交集的中点）。
-            for (int k = 0; k < take; k++)
+            double stepSec = slices[i].Frames > 1
+                ? (slices[i].End - slices[i].Start) / (slices[i].Frames - 1)
+                : 1.0 / SliceFrameRate;
+            if (stepSec <= 0) stepSec = 1.0 / SliceFrameRate;
+            double lo = Math.Max(from, slices[i].Start);
+            double hi = Math.Min(to, slices[i].End);
+            if (hi < lo) continue;
+            int firstFrame = (int)Math.Ceiling((lo - slices[i].Start) / stepSec - 1e-6);
+            int lastFrame = (int)Math.Floor((hi - slices[i].Start) / stepSec + 1e-6);
+            if (firstFrame < 0) firstFrame = 0;
+            if (lastFrame > slices[i].Frames - 1) lastFrame = slices[i].Frames - 1;
+            for (int k = firstFrame; k <= lastFrame; k++)
             {
-                int pick = activeIdx[(int)Math.Round((double)k * (activeIdx.Count - 1) / Math.Max(1, take - 1))];
-                alloc[pick] = 1;
+                allTargets.Add(slices[i].Start + k * stepSec);
+                allSlice.Add(i);
+                allFrame.Add(k);
             }
+        }
+        if (allTargets.Count == 0) return "{\"ok\":true,\"count\":0,\"frames\":[]}";
+
+        // 片内目标递增，于是顺序解码比逐帧 seek 便宜得多（实测 seek 到目标约 71 ms，片内续读只要几毫秒）。
+        // 除了真实时刻，还带着「哪一片的第几帧」：解码时直接按帧号算 PTS，不经过真实秒↔名义秒的往返换算。
+        System.Collections.Generic.List<double> targets = new System.Collections.Generic.List<double>();
+        System.Collections.Generic.List<int> targetSlice = new System.Collections.Generic.List<int>();
+        System.Collections.Generic.List<int> targetFrame = new System.Collections.Generic.List<int>();
+        if (allTargets.Count <= take)
+        {
+            targets.AddRange(allTargets);
+            targetSlice.AddRange(allSlice);
+            targetFrame.AddRange(allFrame);
         }
         else
         {
-            // 点数够覆盖每一片：先各给一个，余量按各片可用长度分配，再从最长的片往回削到预算内。
-            int rest = take - activeIdx.Count;
-            for (int a = 0; a < activeIdx.Count; a++)
+            int prevPick = -1;
+            for (int k = 0; k < take; k++)
             {
-                int i = activeIdx[a];
-                alloc[i] = 1 + (total > 0 ? (int)Math.Round(rest * (upper[i] - lower[i]) / total) : 0);
-            }
-            int sum = 0;
-            for (int i = 0; i < n; i++) sum += alloc[i];
-            while (sum > take)
-            {
-                int heaviest = -1;
-                for (int i = 0; i < n; i++)
-                    if (alloc[i] > 1 && (heaviest < 0 || alloc[i] > alloc[heaviest])) heaviest = i;
-                if (heaviest < 0) break;
-                alloc[heaviest]--;
-                sum--;
-            }
-        }
-
-        // 片内目标递增，于是顺序解码比逐帧 seek 便宜得多（实测 seek 到目标约 71 ms，片内续读只要几毫秒）。
-        System.Collections.Generic.List<double> targets = new System.Collections.Generic.List<double>();
-        for (int i = 0; i < n; i++)
-        {
-            for (int k = 0; k < alloc[i]; k++)
-            {
-                double ratio = alloc[i] == 1 ? 0.5 : (double)k / (alloc[i] - 1);
-                targets.Add(lower[i] + (upper[i] - lower[i]) * ratio);
+                int pick = take == 1
+                    ? 0
+                    : (int)Math.Round((double)k * (allTargets.Count - 1) / (take - 1));
+                if (pick == prevPick) continue;
+                prevPick = pick;
+                targets.Add(allTargets[pick]);
+                targetSlice.Add(allSlice[pick]);
+                targetFrame.Add(allFrame[pick]);
             }
         }
 
@@ -1131,15 +1458,15 @@ internal static class CuHelper
             {
                 for (int i = 0; i < targets.Count; i++)
                 {
-                    if (targets[i] < slice.Start || targets[i] > slice.End) continue;
-                    double want = targets[i] - slice.Start;
-                    double localSec = (realSpan > 0 && span > 0) ? want * span / realSpan : want;
-                    long local = (long)Math.Round(localSec * 10000000.0);
-                    if (local < 0) local = 0;
-                    // 上限必须是**末帧的 PTS**：写成 Frames*1e7/30-1 会比末帧大 333333（一帧），
-                    // 于是靠近片尾的目标点读到 EOF 返回 null、被当成"没有帧"丢掉（实测只回 1 帧）。
-                    long cap = (long)(slice.Frames - 1) * 10000000L / 30;
-                    if (local > cap) local = cap;
+                    if (targetSlice[i] != s) continue;
+                    int frameIndex = targetFrame[i];
+                    if (frameIndex < 0) frameIndex = 0;
+                    if (frameIndex > slice.Frames - 1) frameIndex = slice.Frames - 1;
+                    // PTS 用与编码端**同一个式子**算（`frame * 10000000 / 30`，整数除法）。两边各取整才会
+                    // 精确落在同一帧上：此前把真实秒换算成名义秒再取整，目标会落在两帧之间——`ReadAtOrAfter`
+                    // 于是既跳帧、下一次又因目标不大于上一时间戳而 seek 回同一帧，同一次调用里两种错同时出现
+                    // （2026-09-22 实测：4 秒窗口 122 帧里只有 83 个不同时刻）。帧号也顺带夹住了片尾上限。
+                    long local = (long)frameIndex * 10000000L / 30;
                     if (decoder == null) decoder = new Dsh.MediaFoundation.MFFrameDecoder(slice.Data);
                     // 片内续读要求目标严格大于上一个时间戳；跨不过去就退回 seek。
                     Dsh.MediaFoundation.DecodedFrame decoded = decoder.ReadAtOrAfter(local, local <= lastStamp);
@@ -1325,14 +1652,30 @@ internal static class CuHelper
     /// </summary>
     /// <param name="scale">整数放大倍数，1 表示不放大。注意倍数与区域大小必须联动：
     /// 区域内像素 × scale² 超过模型侧预算时，放大出来的图会被缩回去，等于白放大。</param>
-    private static string CaptureRegion(int x, int y, int w, int h, int quality, int scale)
+    private static string CaptureRegion(int x, int y, int w, int h, int quality, int scale, int center)
     {
         int sw = GetSystemMetrics(SM_CXSCREEN);
         int sh = GetSystemMetrics(SM_CYSCREEN);
         if (w <= 0 || h <= 0) throw new InvalidOperationException("region width/height must be positive");
-        if (x < 0 || y < 0 || x >= sw || y >= sh) throw new InvalidOperationException("region starts outside the screen");
-        if (x + w > sw) w = sw - x;
-        if (y + h > sh) h = sh - y;
+        if (center != 0)
+        {
+            // center=1：x/y 当成**中心点**（点击回执附图就靠它），自动夹到屏内。
+            // 没有这个模式，调用方得先知道屏幕尺寸才能避免"点靠近边缘就取不到图"，
+            // 等于把同一件事在每个调用点重复实现一遍。
+            x = x - w / 2;
+            y = y - h / 2;
+            if (x < 0) { w += x; x = 0; }
+            if (y < 0) { h += y; y = 0; }
+            if (w <= 0 || h <= 0 || x >= sw || y >= sh) throw new InvalidOperationException("region center is outside the screen");
+            if (x + w > sw) w = sw - x;
+            if (y + h > sh) h = sh - y;
+        }
+        else
+        {
+            if (x < 0 || y < 0 || x >= sw || y >= sh) throw new InvalidOperationException("region starts outside the screen");
+            if (x + w > sw) w = sw - x;
+            if (y + h > sh) h = sh - y;
+        }
         if (scale < 1) scale = 1;
         if (scale > 16) scale = 16;
 
@@ -1361,6 +1704,51 @@ internal static class CuHelper
                 + ",\"path\":\"" + Esc(path) + "\",\"bytes\":" + bytes + "}";
             if (scaled != null) scaled.Dispose();
             return response;
+        }
+    }
+
+    /// <summary>
+    /// 对**已经落盘的一帧**裁剪（可选整数倍放大）。
+    ///
+    /// 为什么要有它：回看取回的帧是整屏图，交给模型时会被像素预算缩掉（本机 2560×1440 → 1066×600，
+    /// 十几像素的小球只剩个位像素），要精读就得先裁。原先只有"现抓一帧再裁"的 region，对**历史帧**
+    /// 无能为力 ⇒ 调用方只能自己读文件裁剪，多花一轮。这条命令把"裁剪历史帧"变成一次调用。
+    /// </summary>
+    private static string CropFrame(string path, int x, int y, int w, int h, int scale, int quality)
+    {
+        if (path == null || path.Length == 0) throw new InvalidOperationException("crop_frame needs a path");
+        if (!File.Exists(path)) throw new InvalidOperationException("crop_frame source not found: " + path);
+        using (Bitmap source = new Bitmap(path))
+        {
+            if (w <= 0 || h <= 0) throw new InvalidOperationException("crop_frame width/height must be positive");
+            if (x < 0 || y < 0 || x >= source.Width || y >= source.Height) throw new InvalidOperationException("crop_frame rect starts outside the frame");
+            if (x + w > source.Width) w = source.Width - x;
+            if (y + h > source.Height) h = source.Height - y;
+            if (scale < 1) scale = 1;
+            if (scale > 16) scale = 16;
+
+            using (Bitmap crop = source.Clone(new Rectangle(x, y, w, h), PixelFormat.Format24bppRgb))
+            {
+                Bitmap output = crop;
+                Bitmap scaled = null;
+                if (scale > 1)
+                {
+                    scaled = ScaleBitmap(crop, w * scale, h * scale);
+                    output = scaled;
+                }
+                seq++;
+                string outPath = Path.Combine(outDir, "crop-" + seq + ".jpg");
+                SaveFrame(output, outPath, false, quality);
+                long bytes = new FileInfo(outPath).Length;
+                string response = "{\"ok\":true,\"seq\":" + seq
+                    + ",\"x\":" + x + ",\"y\":" + y + ",\"w\":" + w + ",\"h\":" + h
+                    + ",\"scale\":" + scale
+                    + ",\"src_w\":" + source.Width + ",\"src_h\":" + source.Height
+                    + ",\"out_w\":" + output.Width + ",\"out_h\":" + output.Height
+                    + ",\"path\":\"" + Esc(outPath) + "\",\"bytes\":" + bytes + "}";
+                if (scaled != null) scaled.Dispose();
+                return response;
+            }
         }
     }
 
@@ -1397,7 +1785,8 @@ internal static class CuHelper
     }
 
     /// <summary>
-    /// 一次抓帧、切成 cols×rows 块（每块落盘一张），返回每块对应的**屏幕矩形**；
+    /// 抓一帧（或读一张已落盘的帧）、切成 cols×rows 块（每块落盘一张），返回每块对应的**像素矩形**；
+    /// `sourcePath` 非空时图源是那张帧文件（回看过去的某一刻），空时抓当前屏。
     /// 可选再存一张**同帧缩略图**（整屏等比缩到 `thumbMaxPixels` 像素以内）。
     ///
     /// 与「连续调 N 次 region」的区别是**同帧**：N 次 region 各自抓一帧，在滚动、动画、
@@ -1407,20 +1796,47 @@ internal static class CuHelper
     /// 缩略图与块**同帧**同样要紧：缩略图给方位（一眼看全局），块给精度（1:1 原始像素）；
     /// 两者若来自不同时刻，"在缩略图上找到方位、去块里定位"就可能在动画里指错。
     /// </summary>
-    private static string CaptureGrid(int cols, int rows, int quality, int scale, int thumbMaxPixels)
+    private static string CaptureGrid(int cols, int rows, int quality, int scale, int thumbMaxPixels,
+        string sourcePath)
     {
-        int sw = GetSystemMetrics(SM_CXSCREEN);
-        int sh = GetSystemMetrics(SM_CYSCREEN);
         if (cols < 1 || cols > 16 || rows < 1 || rows > 16)
             throw new InvalidOperationException("grid cols/rows must be within 1..16");
         if (scale < 1) scale = 1;
         if (scale > 16) scale = 16;
 
-        Bitmap full = EnsureBuffer(sw, sh);
-        double before = Now();
-        // 只抓这一次：下面所有块都从这同一帧里 Clone 出来。
-        bufferGraphics.CopyFromScreen(0, 0, 0, 0, new Size(sw, sh), CopyPixelOperation.SourceCopy);
-        double after = Now();
+        // 图源两条：`sourcePath` 为空抓当前屏；非空则读那张**已经落盘的帧**——回看过去的某一刻
+        // 只能走后者（那一刻已不在屏上）。两条路径共用下面同一套切块逻辑，所以块矩形的口径
+        // 只有一处实现，不会随路径漂移。
+        bool fromFrame = sourcePath != null && sourcePath.Length > 0;
+        Bitmap full;
+        int sw;
+        int sh;
+        double before = 0;
+        double after = 0;
+        if (fromFrame)
+        {
+            if (!File.Exists(sourcePath))
+                throw new InvalidOperationException("grid frame source not found: " + sourcePath);
+            // 把帧画进共享缓冲（而不是把 Bitmap 留在外面用）：后续逻辑一行不改，也不多一份
+            // 生命周期要管。尺寸不一致时 EnsureBuffer 会按帧尺寸重建缓冲。
+            using (Bitmap frame = new Bitmap(sourcePath))
+            {
+                sw = frame.Width;
+                sh = frame.Height;
+                full = EnsureBuffer(sw, sh);
+                bufferGraphics.DrawImage(frame, 0, 0, sw, sh);
+            }
+        }
+        else
+        {
+            sw = GetSystemMetrics(SM_CXSCREEN);
+            sh = GetSystemMetrics(SM_CYSCREEN);
+            full = EnsureBuffer(sw, sh);
+            before = Now();
+            // 只抓这一次：下面所有块都从这同一帧里 Clone 出来。
+            bufferGraphics.CopyFromScreen(0, 0, 0, 0, new Size(sw, sh), CopyPixelOperation.SourceCopy);
+            after = Now();
+        }
 
         // 同帧缩略图：等比缩到 thumbMaxPixels 像素以内（缩略图也占模型预算，超了会被再缩一次）。
         string thumbPath = "";
@@ -1483,7 +1899,7 @@ internal static class CuHelper
                 }
             }
         }
-        return "{\"ok\":true,\"cols\":" + cols + ",\"rows\":" + rows
+        return "{\"ok\":true,\"source\":\"" + (fromFrame ? "frame" : "live") + "\",\"cols\":" + cols + ",\"rows\":" + rows
             + ",\"scale\":" + scale
             + ",\"screen_w\":" + sw + ",\"screen_h\":" + sh
             + ",\"tile_w\":" + outWidth + ",\"tile_h\":" + outHeight
@@ -1548,9 +1964,13 @@ internal static class CuHelper
                     }
                     if ((stamp - start) * 1000 >= timeoutMs)
                     {
+                        // 超时分支同样给出基准帧时刻：调用方据此判断事件是否已经发生在基准帧
+                        // **之前**（动作与等待之间那段间隙），这与"事件还没来"的补救动作不同；
+                        // 只回 changed:false 会让这两种成因无法区分（2026-09-22 实测反馈）。
                         return "{\"ok\":true,\"changed\":false"
                             + ",\"diff\":" + ratio.ToString("0.####", CultureInfo.InvariantCulture)
                             + ",\"waited_ms\":" + (int)((stamp - start) * 1000)
+                            + ",\"reference_t\":" + F(referenceAt) + ",\"t\":" + F(stamp)
                             + ",\"x\":" + x + ",\"y\":" + y + ",\"w\":" + w + ",\"h\":" + h + "}";
                     }
                 }
@@ -1586,6 +2006,143 @@ internal static class CuHelper
         }
         if (total == 0) return 0;
         return (double)changed / total;
+    }
+
+    /// <summary>区域内匹配指定颜色（每通道容差 tol）的像素比例；按步长采样，够判断"有没有出现"。</summary>
+    private static double MatchRatio(Bitmap bmp, int r, int g, int b, int tol)
+    {
+        int width = bmp.Width;
+        int height = bmp.Height;
+        int step = Math.Max(1, Math.Min(width, height) / 48);
+        int total = 0;
+        int hit = 0;
+        for (int py = 0; py < height; py += step)
+        {
+            for (int px = 0; px < width; px += step)
+            {
+                Color c = bmp.GetPixel(px, py);
+                total++;
+                if (Math.Abs(c.R - r) <= tol && Math.Abs(c.G - g) <= tol && Math.Abs(c.B - b) <= tol) hit++;
+            }
+        }
+        if (total == 0) return 0;
+        return (double)hit / total;
+    }
+
+    /// <summary>
+    /// 条件触发：盯住一块区域，条件一达成就**当场注入**动作（在同一个循环里）。
+    ///
+    /// 为什么不能由调用方"看到画面再调工具"：那条链路是「读帧 → 模型推理 → 调用 → 注入」，
+    /// 实测批次内的定时精度只有 ±0.2~0.3 秒，而目标窗口可能只有 125ms（2026-09-22 三局失败的
+    /// 共同瓶颈）。把"看"和"动"放进同一次抓屏之后，触发到注入只剩注入本身的开销。
+    ///
+    /// mode=change：区域相对基准帧的变化比例 ≥ ratio 即触发；
+    /// mode=match ：区域内匹配 color（每通道容差 tol）的像素比例 ≥ ratio 即触发。
+    /// action：none / click（在 ax,ay 点击，未给坐标则点当前位置）/ key（按住 key 保持 hold_ms 再抬起，
+    /// hold_ms=0 即瞬时按放）。delay_ms 是触发后再等的毫秒数，补偿"变化被看见时其实已经晚了"的场景。
+    ///
+    /// prime（可选）：**开始盯之前先点一下 prime_x,prime_y**。时机类任务的通用形态是"点 Start 才开计时"，
+    /// 与"盯住目标出现"必须在同一次调用里完成——模型分两次调用会隔着一整轮推理（秒级），
+    /// 而事件可能在点下后 1 秒就发生。基准帧在 prime 之后拍，因此点击引起的画面变化不会被误判成触发。
+    /// </summary>
+    private static string ActWhen(int x, int y, int w, int h, string mode, string color, int tol,
+        double ratio, int timeoutMs, int intervalMs, string action, string keyName, int holdMs,
+        int ax, int ay, bool hasPoint, string button, int delayMs,
+        bool hasPrime, int primeX, int primeY)
+    {
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        if (w <= 0 || h <= 0) throw new InvalidOperationException("act_when width/height 必须为正");
+        if (x < 0 || y < 0 || x >= sw || y >= sh) throw new InvalidOperationException("act_when 区域起点在屏幕外");
+        if (x + w > sw) w = sw - x;
+        if (y + h > sh) h = sh - y;
+        if (timeoutMs <= 0) timeoutMs = 5000;
+        // 与 wait_change 同一个理由：本循环跑在主循环线程里，等待期间所有会话的命令都排队。
+        if (timeoutMs > 10000) timeoutMs = 10000;
+        if (intervalMs < 10) intervalMs = 10;
+        if (ratio <= 0) ratio = 0.02;
+        if (tol < 0) tol = 0;
+
+        int cr = 0, cg = 0, cb = 0;
+        if (mode == "match")
+        {
+            string hex = (color ?? "").TrimStart('#');
+            if (hex.Length != 6) throw new InvalidOperationException("act_when：match 模式需要 color=#RRGGBB");
+            cr = Convert.ToInt32(hex.Substring(0, 2), 16);
+            cg = Convert.ToInt32(hex.Substring(2, 2), 16);
+            cb = Convert.ToInt32(hex.Substring(4, 2), 16);
+        }
+
+        double start = Now();
+        Bitmap buffer = EnsureBuffer(sw, sh);
+        if (hasPrime)
+        {
+            // 预备动作：先把"开始这件事"点下去，再拍基准帧——顺序反了会把点击造成的画面变化当成触发。
+            MouseMoveAbsolute(primeX, primeY);
+            MouseButton(button, "click", 1);
+            Thread.Sleep(30);
+        }
+        start = Now();
+        bufferGraphics.CopyFromScreen(0, 0, 0, 0, new Size(sw, sh), CopyPixelOperation.SourceCopy);
+        Bitmap reference = buffer.Clone(new Rectangle(x, y, w, h), PixelFormat.Format24bppRgb);
+        double referenceAt = Now();
+        try
+        {
+            while (true)
+            {
+                Thread.Sleep(intervalMs);
+                bufferGraphics.CopyFromScreen(0, 0, 0, 0, new Size(sw, sh), CopyPixelOperation.SourceCopy);
+                using (Bitmap current = buffer.Clone(new Rectangle(x, y, w, h), PixelFormat.Format24bppRgb))
+                {
+                    double metric = mode == "match"
+                        ? MatchRatio(current, cr, cg, cb, tol)
+                        : DiffRatio(reference, current);
+                    double detected = Now();
+                    if (metric >= ratio)
+                    {
+                        seq++;
+                        string path = Path.Combine(outDir, "when-" + seq + ".jpg");
+                        SaveFrame(current, path, false, 80);
+                        if (delayMs > 0) Thread.Sleep(delayMs);
+                        string act = "null";
+                        if (action == "click")
+                        {
+                            if (hasPoint) MouseMoveAbsolute(ax, ay);
+                            act = MouseButton(button, "click", 1);
+                        }
+                        else if (action == "key")
+                        {
+                            if (holdMs > 0)
+                            {
+                                KeyEvent(keyName, "down", 0);
+                                Thread.Sleep(holdMs);
+                                act = KeyEvent(keyName, "up", 0);
+                            }
+                            else act = KeyEvent(keyName, "press", 0);
+                        }
+                        return "{\"ok\":true,\"fired\":true,\"mode\":\"" + Esc(mode) + "\""
+                            + ",\"metric\":" + metric.ToString("0.####", CultureInfo.InvariantCulture)
+                            + ",\"waited_ms\":" + (int)((detected - start) * 1000)
+                            + ",\"reaction_ms\":" + (int)((Now() - detected) * 1000)
+                            + ",\"reference_t\":" + F(referenceAt) + ",\"t\":" + F(detected)
+                            + ",\"x\":" + x + ",\"y\":" + y + ",\"w\":" + w + ",\"h\":" + h
+                            + ",\"act\":" + act + ",\"path\":\"" + Esc(path) + "\"}";
+                    }
+                    if ((detected - start) * 1000 >= timeoutMs)
+                    {
+                        return "{\"ok\":true,\"fired\":false,\"mode\":\"" + Esc(mode) + "\""
+                            + ",\"metric\":" + metric.ToString("0.####", CultureInfo.InvariantCulture)
+                            + ",\"waited_ms\":" + (int)((detected - start) * 1000)
+                            + ",\"reference_t\":" + F(referenceAt) + ",\"t\":" + F(detected)
+                            + ",\"x\":" + x + ",\"y\":" + y + ",\"w\":" + w + ",\"h\":" + h + "}";
+                    }
+                }
+            }
+        }
+        finally
+        {
+            reference.Dispose();
+        }
     }
 
     private static int Main(string[] args)
@@ -1635,7 +2192,15 @@ internal static class CuHelper
                     response = CaptureRegion(
                         IntField(line, "x", 0), IntField(line, "y", 0),
                         IntField(line, "w", 0), IntField(line, "h", 0),
-                        IntField(line, "quality", 70), IntField(line, "scale", 1));
+                        IntField(line, "quality", 70), IntField(line, "scale", 1),
+                        IntField(line, "center", 0));
+                }
+                else if (cmd == "crop_frame")
+                {
+                    response = CropFrame(Field(line, "path", ""),
+                        IntField(line, "x", 0), IntField(line, "y", 0),
+                        IntField(line, "w", 0), IntField(line, "h", 0),
+                        IntField(line, "scale", 1), IntField(line, "quality", 70));
                 }
                 else if (cmd == "grid")
                 {
@@ -1643,7 +2208,7 @@ internal static class CuHelper
                     // 模型侧像素预算算，helper 不写死排版。thumb_max_pixels ≤0 表示不出缩略图。
                     response = CaptureGrid(IntField(line, "cols", 2), IntField(line, "rows", 3),
                         IntField(line, "quality", 70), IntField(line, "scale", 1),
-                        IntField(line, "thumb_max_pixels", 640000));
+                        IntField(line, "thumb_max_pixels", 640000), Field(line, "frame", ""));
                 }
                 else if (cmd == "bench")
                 {
@@ -1664,6 +2229,20 @@ internal static class CuHelper
                         DoubleField(line, "threshold", 0.01),
                         IntField(line, "interval_ms", 100));
                 }
+                else if (cmd == "act_when")
+                {
+                    response = ActWhen(
+                        IntField(line, "x", 0), IntField(line, "y", 0),
+                        IntField(line, "w", 0), IntField(line, "h", 0),
+                        Field(line, "mode", "change"), Field(line, "color", ""), IntField(line, "tol", 24),
+                        DoubleField(line, "ratio", 0.02), IntField(line, "timeout_ms", 5000),
+                        IntField(line, "interval_ms", 20), Field(line, "action", "none"),
+                        Field(line, "name", ""), IntField(line, "hold_ms", 0),
+                        IntField(line, "ax", 0), IntField(line, "ay", 0),
+                        IntField(line, "has_point", 0) != 0, Field(line, "button", "left"),
+                        IntField(line, "delay_ms", 0),
+                        IntField(line, "has_prime", 0) != 0, IntField(line, "prime_x", 0), IntField(line, "prime_y", 0));
+                }
                 else if (cmd == "windows") response = ListWindows();
                 else if (cmd == "window_under")
                 {
@@ -1679,6 +2258,9 @@ internal static class CuHelper
                 }
 
                 // ── 注入：与插件侧的动作工具一一对应，坐标一律物理像素 ──
+                // 只读的输入法状态查询：不注入、不改状态，供"键盘没反应"时先分辨成因。
+                else if (cmd == "ime")
+                    response = "{\"ok\":true,\"ime_open\":" + ImeOpenStatus() + ",\"t\":" + F(Now()) + "}";
                 else if (cmd == "mouse_move")
                     response = MouseMoveAbsolute(IntField(line, "x", 0), IntField(line, "y", 0));
                 else if (cmd == "mouse_move_by")
@@ -1689,7 +2271,8 @@ internal static class CuHelper
                 else if (cmd == "scroll")
                     response = Scroll(IntField(line, "vertical", 0), IntField(line, "horizontal", 0));
                 else if (cmd == "key")
-                    response = KeyEvent(Field(line, "name", ""), Field(line, "action", "press"));
+                    response = KeyEvent(Field(line, "name", ""), Field(line, "action", "press"),
+                        IntField(line, "holdMs", 50));
                 else if (cmd == "hotkey")
                     response = Hotkey(StringArrayField(line, "keys"));
                 else if (cmd == "type_text")
@@ -1698,11 +2281,19 @@ internal static class CuHelper
                 else if (cmd == "wait")
                 {
                     // 上限 60 秒：模型不该让会话挂太久，需要更长的等待应该是"分多次"的语义。
+                    // 这个等待会占住主循环（其他会话的命令排队），所以插件层只在小额等待时用它。
                     int waitMs = IntField(line, "ms", 0);
                     if (waitMs < 0) waitMs = 0;
                     if (waitMs > 60000) waitMs = 60000;
+                    double sleepFrom = Now();
                     Thread.Sleep(waitMs);
-                    response = "{\"ok\":true,\"waited_ms\":" + waitMs + ",\"t\":" + F(Now()) + "}";
+                    double sleepTo = Now();
+                    // 回执给**实测**：Now() 走 Windows QPC，是物理时间；而调用方（WSL 侧 Node）
+                    // 自己的钟比它慢约 12%（2026-09-22 实测：请求 1500ms 在 QPC 上是 1683ms），
+                    // 所以"等了多少"必须以这里为准，不能拿调用方的钟去推。
+                    response = "{\"ok\":true,\"requested_ms\":" + waitMs
+                        + ",\"actual_ms\":" + (int)((sleepTo - sleepFrom) * 1000)
+                        + ",\"t\":" + F(sleepTo) + "}";
                 }
                 else if (cmd == "dxgi_probe")
                 {
@@ -1732,7 +2323,8 @@ internal static class CuHelper
                     response = LiveStart(IntField(line, "interval_ms", 33),
                         IntField(line, "quality", 70), IntField(line, "capacity", 1800),
                         Field(line, "backend", "gdi"), Field(line, "codec", "jpeg"),
-                        IntField(line, "segment_frames", 150), DoubleField(line, "retain_s", 1200));
+                        IntField(line, "segment_frames", 150), DoubleField(line, "retain_s", 1200),
+                        Field(line, "record_path", ""));
                 }
                 else if (cmd == "live_stop") response = LiveStop();
                 else if (cmd == "live_stats") response = LiveStats();
@@ -1748,6 +2340,13 @@ internal static class CuHelper
                     response = H264Probe(IntField(line, "frames", 60),
                         (uint)IntField(line, "quality", 90), IntField(line, "segment_frames", 150),
                         Field(line, "backend", "gdi"), IntField(line, "interval_ms", 0));
+                }
+                else if (cmd == "diff")
+                {
+                    // 变化检测：只读像素并算差分，不注入任何输入。
+                    response = DiffFrames(DoubleField(line, "from", 0), DoubleField(line, "to", 1e9),
+                        IntField(line, "limit", 8), IntField(line, "cell", 160),
+                        DoubleField(line, "ratio", 0.02), IntField(line, "max_boxes", 8));
                 }
                 else if (cmd == "quit")
                 {
@@ -1835,6 +2434,17 @@ internal static class CuHelper
     private static int h264SegmentCount;
     private static long h264TotalBytes;
     private static double h264LastSeconds;
+    /** 已封片覆盖到的最新时刻（QPC 秒）。正在写的那一片不在里面，落在它之后的窗口取不到——
+     *  除非先请采集线程结算掉（见 RequestH264Seal）。 */
+    private static double h264SealedUntil;
+    /** 取帧请求伸进未封片区时置位：采集线程写完当前帧就结算这一片。 */
+    private static volatile bool h264FlushRequested;
+    /** 上次按需结算的时刻（QPC 秒）。限流用——否则连续的取帧请求会把片切成一帧一片。 */
+    private static double h264LastFlushAt;
+    /** 按需结算的最小片长（帧）：太短的片不值得重建编码器。 */
+    private static readonly int h264SealMinFrames = 2;
+    /** 按需结算的最小间隔（秒）。 */
+    private static readonly double h264SealMinGap = 1.0;
 
     /// <summary>按时间与字节两个预算淘汰最老的片（调用方必须持有 h264Lock）。</summary>
     private static void PruneH264()
@@ -1848,6 +2458,49 @@ internal static class CuHelper
             h264TotalBytes -= h264Ring[0].Data.Length;
             h264Ring.RemoveAt(0);
         }
+    }
+
+    /// <summary>把当前编码器结算成一片放进环里——到期封片与按需结算走同一条路径，避免两套行为漂移。</summary>
+    private static void SealH264Segment(MemoryEncoder encoder, double segmentStart, double lastFrameAt, int frames)
+    {
+        byte[] sliceBytes = encoder.Finish();
+        encoder.Dispose();
+        lock (h264Lock)
+        {
+            H264Slice slice = new H264Slice();
+            slice.Data = sliceBytes;
+            slice.Start = segmentStart;
+            slice.End = lastFrameAt;
+            slice.Frames = frames;
+            h264Ring.Add(slice);
+            h264TotalBytes += sliceBytes.Length;
+            h264SegmentCount++;
+            h264LastSeconds = Now();
+            if (lastFrameAt > h264SealedUntil) h264SealedUntil = lastFrameAt;
+            PruneH264();
+        }
+    }
+
+    /// <summary>
+    /// 请采集线程立刻结算正在写的那一片，并等它完成（最多约 1.2 秒）。
+    ///
+    /// 存在的理由：未封片的那一片取不到画面，于是"最近不到一个片长（默认 5 秒）"的窗口取不到。
+    /// 常态化缩短片长会推高 CPU（1 秒片实测单核 35.9%，5 秒片 27%），所以改成**只在有人真要这段画面时**
+    /// 付一次结算代价。两道限流（最短片长、最小间隔）避免连续请求把片切碎。
+    /// 代价：等待期间它占住调用方（helper 主循环）——与 `wait_change` 同样的已知约束。
+    /// </summary>
+    private static void RequestH264Seal()
+    {
+        if (!liveRunning || liveCodec != "h264") return;
+        if (Now() - h264LastFlushAt < h264SealMinGap) return;
+        lock (h264Lock)
+        {
+            if (h264Ring.Count == 0 && liveCount < h264SealMinFrames) return;
+        }
+        h264LastFlushAt = Now();
+        h264FlushRequested = true;
+        int guard = 0;
+        while (h264FlushRequested && guard++ < 60) Thread.Sleep(20);
     }
 
     /// <summary>
@@ -1884,18 +2537,57 @@ internal static class CuHelper
         int stride = sw * 4;
         byte[] pixels = new byte[stride * sh];
         MemoryEncoder encoder = null;
+        // 片边界空洞的来源：封片要 Finish+Dispose 旧编码器、再**新建**一个（2560×1440 实测：创建 ~220 ms、
+        // Finish+Dispose ~90 ms）⇒ 这 ~310 ms 里采集停摆，时间轴上留下一段没有帧的空洞（实测约 0.12 s
+        // ≈ 4 帧）。对策：在当前片还剩若干帧时，用**后台线程先把下一个编码器建好**，封片时直接接手，
+        // 停摆只剩 Finish+Dispose。（跨线程创建 + 主线程使用已单独验证可行。）
+        MemoryEncoder pending = null;
+        Thread pendingThread = null;
+        Exception pendingError = null;
+        int prebuildLead = segmentFrames > 24 ? segmentFrames / 3 : 8;
         int index = 0;
         int inSegment = 0;
         double segmentStart = 0;
         double lastFrameAt = 0;
         EnsureMediaFoundation();
+        // 录像：把同一份像素再喂给一个**连续**的文件编码器（不切片，整段一个 mp4）。
+        // 打开失败不能拖垮采集——记下原因继续录内存环，调用方从 live_stats 能看到。
+        if (liveRecordPath.Length > 0)
+        {
+            try
+            {
+                liveRecorder = new FileEncoder(liveRecordPath, sw, sh, true, "quality", (uint)liveQuality, MF.ARGB32);
+                liveRecordFrames = 0;
+                liveRecordStart = Now();
+            }
+            catch (Exception recordFailure)
+            {
+                liveRecorder = null;
+                liveRecordError = recordFailure.Message;
+                Console.Error.WriteLine("录像打开失败（继续采集，不落盘）：{0}", recordFailure.Message);
+            }
+        }
         try
         {
             while (liveRunning)
             {
                 if (encoder == null)
                 {
-                    encoder = new MemoryEncoder(sw, sh, true, "quality", (uint)liveQuality, MF.ARGB32);
+                    if (pendingThread != null)
+                    {
+                        pendingThread.Join();
+                        pendingThread = null;
+                    }
+                    MemoryEncoder built;
+                    Exception buildError;
+                    lock (pendingLock) { built = pending; pending = null; buildError = pendingError; pendingError = null; }
+                    if (buildError != null)
+                    {
+                        Console.Error.WriteLine("h264 预建编码器失败，回退到同步创建：{0}", buildError.Message);
+                    }
+                    encoder = built != null
+                        ? built
+                        : new MemoryEncoder(sw, sh, true, "quality", (uint)liveQuality, MF.ARGB32);
                     inSegment = 0;
                 }
                 Bitmap source;
@@ -1935,29 +2627,53 @@ internal static class CuHelper
                 double frameAt = Now();
                 if (inSegment == 0) segmentStart = frameAt;
                 lastFrameAt = frameAt;
+                if (liveRecorder != null)
+                {
+                    // 时间戳取真实采集时刻（不是帧号）——文件播放速度据此还原，采集率波动时也不会被压缩。
+                    try { liveRecorder.Write(pixels, frameAt - liveRecordStart); liveRecordFrames++; }
+                    catch (Exception recordFailure)
+                    {
+                        liveRecordError = recordFailure.Message;
+                        liveRecorder = null;
+                        Console.Error.WriteLine("录像写入失败，已停写该文件：{0}", recordFailure.Message);
+                    }
+                }
                 encoder.Write(pixels, inSegment);
                 inSegment++;
                 index++;
                 liveCount = index;
 
-                if (inSegment >= segmentFrames)
+                // 到期封片，以及**按需结算**（有取帧请求伸进了还没封的这一片）——两者共用同一条结算路径。
+                // 片快写满时先把下一个编码器建好（后台线程）：封片时就不用等那 ~220 ms 的创建。
+                if (pendingThread == null && inSegment >= segmentFrames - prebuildLead && liveRunning)
                 {
-                    byte[] sliceBytes = encoder.Finish();
-                    encoder.Dispose();
-                    encoder = null;
-                    lock (h264Lock)
+                    MemoryEncoder stale;
+                    lock (pendingLock) { stale = pending; pending = null; }
+                    if (stale != null) stale.Dispose();
+                    pendingThread = new Thread(delegate()
                     {
-                        H264Slice slice = new H264Slice();
-                        slice.Data = sliceBytes;
-                        slice.Start = segmentStart;
-                        slice.End = lastFrameAt;
-                        slice.Frames = inSegment;
-                        h264Ring.Add(slice);
-                        h264TotalBytes += sliceBytes.Length;
-                        h264SegmentCount++;
-                        h264LastSeconds = Now();
-                        PruneH264();
-                    }
+                        try
+                        {
+                            MF.CoInitializeEx(IntPtr.Zero, 0);
+                            MemoryEncoder fresh = new MemoryEncoder(sw, sh, true, "quality", (uint)liveQuality, MF.ARGB32);
+                            lock (pendingLock) { pending = fresh; }
+                        }
+                        catch (Exception buildFailure)
+                        {
+                            lock (pendingLock) { pendingError = buildFailure; }
+                        }
+                    });
+                    pendingThread.IsBackground = true;
+                    pendingThread.Start();
+                }
+
+                bool due = inSegment >= segmentFrames;
+                bool onDemand = h264FlushRequested && inSegment >= h264SealMinFrames;
+                if (due || onDemand)
+                {
+                    SealH264Segment(encoder, segmentStart, lastFrameAt, inSegment);
+                    encoder = null;
+                    h264FlushRequested = false;
                 }
 
                 if (interval > 0)
@@ -1973,6 +2689,27 @@ internal static class CuHelper
         }
         finally
         {
+            if (pendingThread != null)
+            {
+                try { pendingThread.Join(3000); }
+                catch (ThreadStateException) { Console.Error.WriteLine("h264 预建线程没能启动，跳过等待"); }
+                pendingThread = null;
+            }
+            MemoryEncoder leftover;
+            lock (pendingLock) { leftover = pending; pending = null; }
+            if (leftover != null) leftover.Dispose();
+            // 收尾录像文件：Finalize 才写文件尾（moov 索引），不调用就得到一个播放器读不了的文件。
+            if (liveRecorder != null)
+            {
+                try { liveRecorder.Finish(); }
+                catch (Exception finishFailure)
+                {
+                    liveRecordError = finishFailure.Message;
+                    Console.Error.WriteLine("录像收尾失败：{0}", finishFailure.Message);
+                }
+                liveRecorder.Dispose();
+                liveRecorder = null;
+            }
             if (encoder != null) encoder.Dispose();
             if (context != null) context.Dispose();
             if (grab != null) grab.Dispose();

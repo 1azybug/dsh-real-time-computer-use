@@ -319,3 +319,96 @@ internal sealed class MemoryEncoder : IDisposable
 
     public void Dispose() { MF.Release(ref codec); MF.Release(ref writer); MF.Release(ref byteStream); MF.Release(ref stream); }
 }
+
+/// <summary>
+/// 把采集帧直接编码成 mp4 文件：**一个连续编码器**（不切片），时间戳用**真实采集时刻**。
+/// 时间戳必须在采集侧定，不能用"帧号 ÷ 30"：采集率受抓屏与编码耗时影响会波动，
+/// 一旦实际帧率偏离名义值，成片的播放速度就会跟着错（实测 jpeg 逐帧只有 ~15 fps，
+/// 若按 30 fps 写时间戳，视频会快一倍）。
+/// </summary>
+internal sealed class FileEncoder : IDisposable
+{
+    private IntPtr writer, codec;
+    private uint index;
+    private bool finished;
+    private long lastTime = -1;
+    internal string Path { get; private set; }
+    internal int Frames { get; private set; }
+    internal long Bytes { get; private set; }
+
+    internal FileEncoder(string path, int width, int height, bool hardware, string mode, uint quality, Guid inputFormat)
+    {
+        Path = path;
+        IntPtr attributes = IntPtr.Zero, input = IntPtr.Zero, output = IntPtr.Zero, encodingParameters = IntPtr.Zero;
+        try
+        {
+            string dir = System.IO.Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+            MF.Check(MF.MFCreateAttributes(out attributes, 5), "MFCreateAttributes");
+            MF.UInt32(attributes, "a634a91c-822b-41b9-a494-4de4643612b0", hardware ? 1U : 0U);
+            MF.UInt32(attributes, "08b845d8-2b74-4afe-9d53-be16d2d5ae4f", 1);
+            MF.GuidValue(attributes, "150ff23f-4abc-478b-ac4f-e1916fba1cca", new Guid("dc6cd05d-b9d0-40ef-bd35-fa622c1ab28a"));
+            // 与内存版唯一的差别：给**文件 URL**（内存版给 url=null + 内存 byte stream）。
+            MF.Check(MF.MFCreateSinkWriterFromURL(path, IntPtr.Zero, attributes, out writer), "MFCreateSinkWriterFromURL(file)");
+            output = MF.Type(MF.H264, width, height);
+            MF.UInt32(output, "20332624-fb0d-4d9e-bd0d-cbf6786c102e", 12000000);
+            MF.UInt32(output, "ad76a80b-2d5c-4e0b-b375-64e520137036", 100);
+            MF.Check(MF.Call<MF.AddStream>(writer, 3)(writer, output, out index), "AddStream(H264)");
+            input = MF.Type(inputFormat, width, height);
+            if (inputFormat == MF.RGB32 || inputFormat == MF.ARGB32) MF.UInt32(input, "644b4e48-1e02-4516-b0eb-c01ca9d49ac6", (uint)(width * 4));
+            MF.Check(MF.MFCreateAttributes(out encodingParameters, 4), "MFCreateAttributes(encoding)");
+            if (mode != "default")
+            {
+                MF.UInt32(encodingParameters, MF.RateControl, mode == "qp" || mode == "quality" ? 3U : 0U);
+                MF.UInt32(encodingParameters, MF.GOP, 30);
+                if (mode == "qp") MF.Pair(encodingParameters, MF.QP, 0, quality);
+                if (mode == "quality") MF.UInt32(encodingParameters, MF.Quality, quality);
+            }
+            MF.Check(MF.Call<MF.SetInput>(writer, 4)(writer, index, input, encodingParameters), "SetInputMediaType");
+            Guid service = Guid.Empty, codecId = new Guid(MF.CodecIid);
+            MF.Check(MF.Call<MF.GetService>(writer, 12)(writer, index, ref service, ref codecId, out codec), "GetService(ICodecAPI)");
+            MF.Check(MF.Call<MF.Simple>(writer, 5)(writer), "BeginWriting");
+            if (mode != "default")
+            {
+                SetCodec(MF.RateControl, mode == "qp" || mode == "quality" ? 3UL : 0UL);
+                if (mode == "qp") SetCodec(MF.QP, quality);
+                if (mode == "quality") SetCodec(MF.Quality, quality);
+                SetCodec(MF.GOP, 30);
+            }
+        }
+        catch { Dispose(); throw; }
+        finally { MF.Release(ref encodingParameters); MF.Release(ref input); MF.Release(ref output); MF.Release(ref attributes); }
+    }
+
+    private void SetCodec(string key, ulong value)
+    {
+        // 参数已随 SetInputMediaType 传过，这里只是把 ICodecAPI 的分量也对齐（回读校验在 MemoryEncoder 里做过）。
+        Guid id = new Guid(key); MF.Variant variant = new MF.Variant(); variant.Type = 19; variant.UInt64 = value;
+        MF.Check(MF.Call<MF.CodecValue>(codec, 9)(codec, ref id, ref variant), "ICodecAPI.SetValue " + key);
+    }
+
+    /// <param name="seconds">该帧的**真实采集时刻**（相对录制起点，秒）。</param>
+    internal void Write(byte[] data, double seconds)
+    {
+        long time = (long)Math.Round(seconds * 10000000.0);
+        if (time <= lastTime) time = lastTime + 10000;   // 严格递增：同一时刻来的多帧按 1 ms 依次排开
+        long duration = lastTime < 0 ? 333333 : time - lastTime;
+        lastTime = time;
+        IntPtr sample = MF.Sample(data, time, duration);
+        try { MF.Check(MF.Call<MF.WriteSample>(writer, 6)(writer, index, sample), "WriteSample"); }
+        finally { MF.Release(ref sample); }
+        Frames++;
+    }
+
+    /// <summary>写完文件尾（moov 索引）。不调用就等于文件没封口，播放器读不了。</summary>
+    internal void Finish()
+    {
+        if (finished) return;
+        MF.Check(MF.Call<MF.Simple>(writer, 11)(writer), "Finalize");
+        finished = true;
+        try { Bytes = new System.IO.FileInfo(Path).Length; }
+        catch (System.IO.IOException) { Bytes = 0; }
+    }
+
+    public void Dispose() { MF.Release(ref codec); MF.Release(ref writer); }
+}
