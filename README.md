@@ -79,8 +79,8 @@ The remaining keys are ordinary capture settings:
 | Key | Default | Meaning |
 |---|---|---|
 | `backend` | `dxgi` | capture backend: `dxgi` (GPU copy, ~0.42 ms/frame) or `gdi` (~28.9 ms/frame) |
-| `frameIntervalMs` | `25` | capture interval ≈ 40 fps. Deliberately below 33 ms: when the target **is** 33 ms, jitter makes ~14% of frames exceed a 33.3 ms per-frame bound. 25 ms leaves ~8 ms headroom and measures 100% within bound. |
-| `frameCapacity` | `1800` | frames retained by the ring buffer (≈45 s at the 40 fps capture rate) |
+| `frameIntervalMs` | `16` | capture interval ≈ 62.5 fps — **the only place the capture rate is decided** (`screen_watch` has no `fps` argument). Deliberately far below the 33.333 ms per-frame bound: at 25 ms only 8.3 ms of headroom is left and the once-per-segment encoder pre-build (10–15 ms of concurrent work) crosses it; at 16 ms the headroom is 17.3 ms and the same jitter stays inside. Measured under a full-screen load with a second helper recording: 4/2408 misses at 25 ms vs 1/11217 at 16 ms. Costs ≈79% of one core (vs 52%) and 1.5× the recording size. |
+| `frameCapacity` | `1800` | frames retained by the ring buffer; only the `jpeg` codec uses it — `h264` windows are bounded by `retain_s` and the byte budget |
 | `jpegQuality` | `70` | JPEG quality |
 | `codec` | `h264` | frame storage: `h264` (in-memory segments, ~445 MB per 20 min) or `jpeg` (per-frame files, 6–11 GB) |
 | `captureDir` | `''` | frame output directory; empty means the helper's own temp directory |
@@ -106,16 +106,16 @@ loads and all 16 tools register. The same symbols are also present in `@deepseek
   must not act at the same time, or their actions interleave.
 - Capture runs at the rate fixed by `frameIntervalMs` (40 fps in the shipped patch) and costs roughly a quarter of
   one core while active. The rate is a deployment choice, not a tool argument: `screen_watch` has no `fps` parameter.
-- **The per-frame interval bound is not fully met.** The target is that no frame interval exceeds **33.333 ms**
-  (`frameIntervalMs: 25`). Measured at 2560×1440 / h264 / dxgi under a full-screen animation load with a second
-  helper recording alongside: **4–5 frames out of ~2400 exceed it** (35–37 ms, so 99.8% within bound). Every one of
-  those frames is the one where the **next encoder is pre-built** — roughly 220 ms of Media Foundation work running
-  concurrently with capture; it is not a capture or encode throughput limit. Sealing (`Finish`+`Dispose`, 176 ms
-  under load) was moved off the capture thread, which took the once-per-segment boundary misses from 9 frames to 0.
-  Closing the remainder needs the encoder not to be rebuilt per segment (a continuous writer with logical segments),
-  which is **not implemented**. A resident pre-build thread with the capture thread at `AboveNormal` and background
-  work at `BelowNormal` only moved the same stall to a different frame (118 instead of 100) and made the worst case
-  worse (55.9 ms vs 37.6 ms), so it was **not adopted**. Numbers and conditions: `helper/README.md`.
+- **The per-frame interval bound is met at the shipped rate, with a rare exception.** The target is that no frame
+  interval exceeds **33.333 ms**; the shipped `frameIntervalMs: 16` (62.5 fps) leaves 17.3 ms of headroom, so the
+  once-per-segment encoder pre-build (~220 ms of Media Foundation work started concurrently with capture, costing the
+  capture thread 10–15 ms) no longer crosses the bound. Measured under a full-screen animation load with a second
+  helper recording alongside: **1 frame of 11217** at 16 ms, versus 4 of 2408 at 25 ms; that single miss was a
+  system-level spike (64.7 ms), not the pre-build. Sealing (`Finish`+`Dispose`, 176 ms under load) runs on its own
+  thread. **Zero misses are not guaranteed** — a system-level stall can still exceed the bound at any rate. A tested
+  alternative (resident pre-build thread, capture at `AboveNormal` / background at `BelowNormal`) only moved the same
+  stall to a different frame and made the worst case worse, so it was **not adopted**. Numbers/conditions:
+  `helper/README.md`.
 - H.264 segments are lossy (PSNR 44.8–50 dB); it does not affect reading small text, but it is not lossless.
 - The helper must be recompiled with the Windows-shipped `csc.exe` if you change `helper/*.cs`; the build command is
   in `helper/README.md`.

@@ -33,7 +33,7 @@ So the order is **look first, act fast, reason little**.
 
 ## 3. Chase motion: record, then replay
 
-- **Start capture first** (`screen_watch start`, frame rate fixed by configuration at 40 fps ⇒ 25 ms per frame) and let it record at a fixed interval;
+- **Start capture first** (`screen_watch start`, frame rate fixed by configuration at 62.5 fps ⇒ 16 ms per frame) and let it record at a fixed interval;
   afterwards pull that short stretch back by timestamp with `screen_frames`.
 - **Sample densely, several frames at once**: pull the stretch you care about as densely as possible (at most 16 frames per call —
   just narrow the window to that stretch). That costs fewer reasoning rounds than several sparse requests: whatever is going to happen
