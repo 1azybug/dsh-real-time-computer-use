@@ -54,10 +54,27 @@ Optional tools stay unregistered unless enabled in configuration: `wait_for_chan
 
 ## Configuration
 
-Every key lives in `cordis.patch.yml`. The shipped defaults follow one specific operating profile — a GUI evaluation
-setup where a single-image view and a global `read_image` are deliberately disabled — which is why every optional tool
-starts off and `denyReadImage` is `true`. The comments in the file record the reasoning; turn them on if your use case
-wants them.
+Every knob lives in `cordis.patch.yml`, and **the shipped defaults are not a neutral baseline**: they are the
+configuration one GUI-evaluation setup runs with. Out of the box you get a **16-tool** surface; switching the four
+optional groups on widens it to **21 tools** and re-enables ordinary image reading.
+
+Read those four defaults as answers to four questions, not as arbitrary flags:
+
+| Switch | Default | With the default | Turning it on adds |
+|---|---|---|---|
+| `triggerTools` | `false` | nothing watches the screen waiting for a condition | `wait_for_change`, `act_when` — poll a region until it changes, then act |
+| `singleImageTools` | `false` | screen reading only ever arrives as the same-frame thumbnail + tiles form | `screen_observe`, `region_observe` — hand back a single image |
+| `denyReadImage` | **`true`** | a tool guard rejects **every** `read_image` call — with or without `region`, for every session, not only screen captures | normal image reading works again |
+| `diffTool` | `false` | no frame differencing | `screen_diff` — report which grid cells changed |
+
+Why those defaults: on a 2560×1440 desktop a single full-screen image is either downscaled past legibility (a 46 px
+control becomes 19 px) or covers one corner, so the plugin standardizes on one full-view form — `screen_grid`, one
+capture turned into a same-frame thumbnail plus 1:1 tiles. Letting `read_image` back in would restore the
+single-image path for *any* image, not only screen captures. The `triggerTools` entry is an evaluation constraint
+(watching for a visual condition and then acting counts as cheating in that setting), not a technical limit. The
+comments in the file record each decision.
+
+The remaining keys are ordinary capture settings:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -68,10 +85,10 @@ wants them.
 | `codec` | `h264` | frame storage: `h264` (in-memory segments, ~445 MB per 20 min) or `jpeg` (per-frame files, 6–11 GB) |
 | `captureDir` | `''` | frame output directory; empty means the helper's own temp directory |
 | `helperPath` | `''` | helper executable; empty means the bundled `helper/CuHelper.exe` |
-| `triggerTools` | `false` | register `wait_for_change` / `act_when` |
-| `singleImageTools` | `false` | register `screen_observe` / `region_observe` (single-image forms) |
-| `denyReadImage` | `false` | reject `read_image` through a tool guard |
-| `diffTool` | `false` | register `screen_diff` |
+
+The plugin's own code defaults differ for `backend` (`gdi`) and `codec` (`jpeg`): the patch file is where a
+deployment states its choice, and the code keeps the conservative value for deployments that mount the plugin
+without it. `denyReadImage` is `true` in both.
 
 ## Host APIs used
 
