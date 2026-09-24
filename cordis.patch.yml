@@ -1,11 +1,11 @@
-# dsh-computer-use —— DSH bundle patch
+# dsh-real-time-computer-use —— DSH bundle patch
 #
 # 把 Computer Use 插进 profile 的 HOST 层（root scope）：采集与注入都要落在宿主进程里
 # （helper 是常驻的 Windows 进程），且每个会话都要能用同一套工具。
 # 改动需要重启 `dsh web` 才生效。
 - insert:
-    - id: dsh-computer-use
-      name: dsh-computer-use
+    - id: dsh-real-time-computer-use
+      name: dsh-real-time-computer-use
       config:
         # 帧输出目录（Windows 侧）；留空则用 helper 自己的临时目录
         captureDir: ''
