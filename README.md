@@ -54,8 +54,10 @@ Optional tools stay unregistered unless enabled in configuration: `wait_for_chan
 
 ## Configuration
 
-Every key lives in `cordis.patch.yml`; the shipped defaults are a general-purpose baseline, and the comments there
-record why each optional tool is off.
+Every key lives in `cordis.patch.yml`. The shipped defaults follow one specific operating profile — a GUI evaluation
+setup where a single-image view and a global `read_image` are deliberately disabled — which is why every optional tool
+starts off and `denyReadImage` is `true`. The comments in the file record the reasoning; turn them on if your use case
+wants them.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -74,10 +76,11 @@ record why each optional tool is off.
 ## Host APIs used
 
 The plugin registers against the harness `ToolService` (`ctx.tools.register`, `ctx.tools.guard`, `ctx.tools.restrict`)
-and Cordis `ctx.effect` for ownership. Those symbols are present in `@deepseek-ai/dsh-tools@0.1.7-rc.1` and
-`0.1.5-rc.3` (checked by unpacking the published tarballs), but the plugin has not yet been loaded end-to-end on a
-harness other than the machine it was developed on — treat cross-version loading as **verified by inspection, not by
-a live run**.
+and Cordis `ctx.effect` for ownership.
+
+Verified by a live run on a clean install: harness `@deepseek-ai/dsh@0.1.7-rc.1` (the newest published release at the
+time of writing) in a fresh `DSH_HOME`, this repository cloned from GitHub and linked into the profile — the plugin
+loads and all 16 tools register. The same symbols are also present in `@deepseek-ai/dsh-tools@0.1.5-rc.3`.
 
 ## Limits
 
