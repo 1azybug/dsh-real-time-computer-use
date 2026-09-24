@@ -1,0 +1,47 @@
+# dsh-computer-use —— DSH bundle patch
+#
+# 把 Computer Use 插进 profile 的 HOST 层（root scope）：采集与注入都要落在宿主进程里
+# （helper 是常驻的 Windows 进程），且每个会话都要能用同一套工具。
+# 改动需要重启 `dsh web` 才生效。
+- insert:
+    - id: dsh-computer-use
+      name: dsh-computer-use
+      config:
+        # 帧输出目录（Windows 侧）；留空则用 helper 自己的临时目录
+        captureDir: ''
+        # 采集后端：dxgi（GPU 侧拷贝，读帧 0.42ms/帧）| gdi（回退，读帧 28.9ms/帧）
+        backend: dxgi
+        # 持续采集的目标间隔（毫秒）：33 = 30 fps；也是 screen_watch 不传 fps 时的默认帧率
+        frameIntervalMs: 33
+        # 环形缓冲保留的帧数（30 fps × 60s = 1800）
+        frameCapacity: 1800
+        # JPEG 质量
+        jpegQuality: 70
+        # 帧的存储编码：h264（内存切片）| jpeg（逐帧写盘）。
+        # 2026-09-22 由 jpeg 改为 h264：同一目标（2560×1440 @30fps、20 分钟）实测 JPEG 要 6–11 GB、
+        # 单核 44%，而 H.264 只要 445 MB、单核 27% —— 主人的评测要 20 分钟常驻，jpeg 装不下。
+        # 当初默认留 jpeg 是因为 h264 有"未封片的最近 5 秒取不到"的硬缺口；该缺口本代已解
+        # （取帧/问最新帧时采集端按需结算，最多等约 1 秒），所以现在切过来。
+        # 代价：取帧要现场解码（每帧几十毫秒），且 screen_frames 的 available 是"按时间窗解出的张数"
+        # 而不是窗口内的真实帧数。改这里要重启 dsh web；screen_watch 的 codec 参数可临时覆盖。
+        codec: h264
+        # 「**盯着画面等条件的自动触发**」类工具（wait_for_change / act_when）是否注册。
+        # **保持 false**：主人 2026-09-22 明确——本机这套 Computer Use 正用于他论文的 GUI 评测，
+        # 而该口径下"程序化地等某个视觉条件达成再自动动作"算作弊。允许的是「按已知信息定时等待 + 动作」
+        # （wait 与动作同批提交）与各种纯观察（截图/取帧/窗口查询）。改这里要重启 dsh web。
+        triggerTools: false
+        # 是否注册「**只返回一张图**」的观察工具（screen_observe / region_observe）。
+        # **保持 false**：主人 2026-09-22 23:23 定——单图形态要么被缩到像素预算内（小控件看不清）、
+        # 要么只覆盖一小块；看清屏幕的推荐形态只有 screen_grid（同一次抓帧给缩略图 + 1:1 分块，
+        # 要看哪块取哪块；回看某一帧用 screen_grid({atSeconds})）。改这里要重启 dsh web。
+        singleImageTools: false
+        # 是否整体停用 `read_image`（通用图像工具）。
+        # **置 true**：主人 2026-09-22 23:40——「read_image 必须得禁」，且注明不是评测期口径
+        # （「多图效果就是好」）。单图看不清：整图会被缩到像素预算内、裁一块又只见局部；
+        # 看画面统一走 screen_grid。想要保留读图能力可置 false。改这里要重启 dsh web。
+        denyReadImage: true
+        # 是否注册 `screen_diff`（相邻帧差分，回"哪块变了"的矩形序列）。
+        # **保持 false**：主人 2026-09-22 20:13 定——判断时机一律用**画面端点帧**，
+        # 而 screen_diff 只给"网格单元 + 阈值"算出的矩形、精度不足以当判据
+        # （可能静默漏检、也不给精确帧时刻）。改这里要重启 dsh web。
+        diffTool: false

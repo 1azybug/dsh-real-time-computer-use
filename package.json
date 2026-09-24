@@ -1,0 +1,33 @@
+{
+  "name": "dsh-real-time-computer-use",
+  "version": "0.1.0",
+  "description": "Real-time Computer Use for DeepSeek Harness on Windows: full-screen capture, timestamp replay, and mouse/keyboard injection",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "computer-use",
+    "windows",
+    "automation"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "helper",
+    "skills",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1azybug/dsh-real-time-computer-use.git"
+  },
+  "author": "1azybug"
+}
