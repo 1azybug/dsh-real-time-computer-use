@@ -2468,7 +2468,7 @@ internal static class CuHelper
                 }
                 else if (cmd == "live_start")
                 {
-                    response = LiveStart(IntField(line, "interval_ms", 33),
+                    response = LiveStart(IntField(line, "interval_ms", 25),   // 与 liveIntervalMs 的默认值保持一致（见其注释）
                         IntField(line, "quality", 70), IntField(line, "capacity", 1800),
                         Field(line, "backend", "gdi"), Field(line, "codec", "jpeg"),
                         IntField(line, "segment_frames", 150), DoubleField(line, "retain_s", 1200),
