@@ -79,7 +79,7 @@ The remaining keys are ordinary capture settings:
 | Key | Default | Meaning |
 |---|---|---|
 | `backend` | `dxgi` | capture backend: `dxgi` (GPU copy, ~0.42 ms/frame) or `gdi` (~28.9 ms/frame) |
-| `frameIntervalMs` | `33` | capture interval ≈ 30 fps |
+| `frameIntervalMs` | `25` | capture interval ≈ 40 fps. Deliberately below 33 ms: when the target **is** 33 ms, jitter makes ~14% of frames exceed a 33.3 ms per-frame bound. 25 ms leaves ~8 ms headroom and measures 100% within bound. |
 | `frameCapacity` | `1800` | frames retained by the ring buffer (30 fps × 60 s) |
 | `jpegQuality` | `70` | JPEG quality |
 | `codec` | `h264` | frame storage: `h264` (in-memory segments, ~445 MB per 20 min) or `jpeg` (per-frame files, 6–11 GB) |

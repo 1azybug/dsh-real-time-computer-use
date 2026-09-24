@@ -12,7 +12,7 @@
         # 采集后端：dxgi（GPU 侧拷贝，读帧 0.42ms/帧）| gdi（回退，读帧 28.9ms/帧）
         backend: dxgi
         # 持续采集的目标间隔（毫秒）：33 = 30 fps；也是 screen_watch 不传 fps 时的默认帧率
-        frameIntervalMs: 33
+        frameIntervalMs: 25
         # 环形缓冲保留的帧数（30 fps × 60s = 1800）
         frameCapacity: 1800
         # JPEG 质量
