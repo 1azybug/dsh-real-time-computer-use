@@ -1109,8 +1109,18 @@ internal static class CuHelper
         else if (intervalMs < 0) liveIntervalMs = 0;
         if (quality > 0) liveQuality = quality;
         if (capacity > 0) liveCapacity = capacity;
+        // 上一轮的封片线程若还没退干净（LiveStop 的 Join 曾超时），先等它收干队列再起新的，
+        // 免得两个 worker 抢同一个队列、把片序打乱。
+        h264SealWorkerRunning = false;
+        if (h264SealWorker != null)
+        {
+            try { h264SealWorker.Join(2000); }
+            catch (ThreadStateException) { Console.Error.WriteLine("h264 封片线程没能启动，跳过等待"); }
+            h264SealWorker = null;
+        }
+        lock (h264SealQueue) { h264SealQueue.Clear(); }
         lock (ringLock) { ring.Clear(); }
-        lock (h264Lock) { h264Ring.Clear(); h264TotalBytes = 0; h264SegmentCount = 0; h264LastSeconds = 0; h264SealedUntil = Now(); }
+        lock (h264Lock) { h264Ring.Clear(); h264TotalBytes = 0; h264SegmentCount = 0; h264LastSeconds = 0; h264SealedUntil = Now(); h264SealInFlight = 0; }
         h264FlushRequested = false;
         h264LastFlushAt = 0;
         liveStart = Now();
@@ -2594,6 +2604,31 @@ internal static class CuHelper
     /** 按需结算的最小间隔（秒）。 */
     private static readonly double h264SealMinGap = 1.0;
 
+    /**
+     * 待封片的段。采集线程只入队（~0 ms），Finish/Dispose/入环交给封片线程。
+     *
+     * 为什么必须挪走：封片要 Finish+Dispose，2560×1440 实测 **176 ms**（2026-09-24 本机负载下；
+     * 空载约 90 ms），落在采集线程上就是时间轴上 3–5 帧的空洞——当天评测录像里违约帧多数落在
+     * 片边界附近，最长的 142 ms 正是它。独立实验见 encode-test/AsyncSealProbe.cs：
+     * 同步封片 176.2 ms；后台封片时主线程 25 ms 节拍的最坏间隔 35.9 ms vs 无封片基线 31.8 ms
+     * （差 4.1 ms），且异步产出的字节与同步**逐字节相同**（1715765 B）。
+     */
+    private sealed class H264SealJob
+    {
+        internal MemoryEncoder Encoder;
+        internal double Start;
+        internal double LastFrameAt;
+        internal int Frames;
+    }
+    /** 封片队列：FIFO，保证环内片序与采集顺序一致。 */
+    private static readonly System.Collections.Generic.Queue<H264SealJob> h264SealQueue =
+        new System.Collections.Generic.Queue<H264SealJob>();
+    /** 在途封片数（排队中 + 正在封）。取帧方要等它归零，才算"片真的进了环"。 */
+    private static int h264SealInFlight;
+    /** 封片线程：采集开始时创建，队列排空且采集已停时自行退出。 */
+    private static Thread h264SealWorker;
+    private static volatile bool h264SealWorkerRunning;
+
     /// <summary>按时间与字节两个预算淘汰最老的片（调用方必须持有 h264Lock）。</summary>
     private static void PruneH264()
     {
@@ -2608,7 +2643,12 @@ internal static class CuHelper
         }
     }
 
-    /// <summary>把当前编码器结算成一片放进环里——到期封片与按需结算走同一条路径，避免两套行为漂移。</summary>
+    /// <summary>
+    /// 结算一片：Finish + Dispose + 入环 + 按预算淘汰。到期封片与按需结算走同一条路径，避免两套行为漂移。
+    ///
+    /// **只由封片线程调用**（见 EnqueueH264Seal）：这里的 Finish+Dispose 实测 176 ms，放在采集线程上就是
+    /// 时间轴上的空洞。方法自己取 h264Lock，因此与采集线程的入环/淘汰互斥。
+    /// </summary>
     private static void SealH264Segment(MemoryEncoder encoder, double segmentStart, double lastFrameAt, int frames)
     {
         byte[] sliceBytes = encoder.Finish();
@@ -2630,6 +2670,54 @@ internal static class CuHelper
     }
 
     /// <summary>
+    /// 把一片交给封片线程（采集线程只做这一步，几乎不花时间），自己立刻继续采集下一片。
+    /// </summary>
+    private static void EnqueueH264Seal(MemoryEncoder encoder, double segmentStart, double lastFrameAt, int frames)
+    {
+        H264SealJob job = new H264SealJob();
+        job.Encoder = encoder;
+        job.Start = segmentStart;
+        job.LastFrameAt = lastFrameAt;
+        job.Frames = frames;
+        lock (h264SealQueue) { h264SealQueue.Enqueue(job); }
+        lock (h264Lock) { h264SealInFlight++; }
+    }
+
+    /// <summary>封片线程：取一片、结算一片；队列排空且采集已停时退出。</summary>
+    private static void H264SealWorkerLoop()
+    {
+        MF.CoInitializeEx(IntPtr.Zero, 0);   // COM 按线程，封片线程自己初始化
+        while (true)
+        {
+            H264SealJob job;
+            bool drained;
+            lock (h264SealQueue)
+            {
+                job = h264SealQueue.Count > 0 ? h264SealQueue.Dequeue() : null;
+                drained = h264SealQueue.Count == 0;
+            }
+            if (job == null)
+            {
+                if (!h264SealWorkerRunning) return;
+                Thread.Sleep(4);
+                continue;
+            }
+            try
+            {
+                SealH264Segment(job.Encoder, job.Start, job.LastFrameAt, job.Frames);
+            }
+            catch (Exception sealFailure)
+            {
+                // 单片封失败不该拖垮采集：记录原因，继续处理后面的片。
+                Console.Error.WriteLine("后台封片失败：{0}", sealFailure.Message);
+            }
+            lock (h264Lock) { if (h264SealInFlight > 0) h264SealInFlight--; }
+            // 排空后才清请求标志：取帧方等的是"片真的进了环"，不是"请求被收下"。
+            if (drained) h264FlushRequested = false;
+        }
+    }
+
+    /// <summary>
     /// 请采集线程立刻结算正在写的那一片，并等它完成（最多约 1.2 秒）。
     ///
     /// 存在的理由：未封片的那一片取不到画面，于是"最近不到一个片长（默认 5 秒）"的窗口取不到。
@@ -2647,8 +2735,16 @@ internal static class CuHelper
         }
         h264LastFlushAt = Now();
         h264FlushRequested = true;
+        // 等两件事：采集线程收下这个请求（入队并清自己那侧的标志）、以及所有在途封片进环。
+        // 封片现在跑在别的线程上 ⇒ 这次等待不会让采集停摆（采集线程只负责入队）。
         int guard = 0;
-        while (h264FlushRequested && guard++ < 60) Thread.Sleep(20);
+        while (guard++ < 60)
+        {
+            bool pending;
+            lock (h264Lock) { pending = h264SealInFlight > 0; }
+            if (!pending && !h264FlushRequested) return;
+            Thread.Sleep(20);
+        }
     }
 
     /// <summary>
@@ -2699,6 +2795,11 @@ internal static class CuHelper
         double lastFrameAt = 0;
         EnsureMediaFoundation();
         liveWaitTimer = CreatePreciseTimer();
+        // 封片线程：采集期间只干一件事——把队列里的片 Finish/Dispose 并放进环。
+        h264SealWorkerRunning = true;
+        h264SealWorker = new Thread(H264SealWorkerLoop);
+        h264SealWorker.IsBackground = true;
+        h264SealWorker.Start();
         // 录像：把同一份像素再喂给一个**连续**的文件编码器（不切片，整段一个 mp4）。
         // 打开失败不能拖垮采集——记下原因继续录内存环，调用方从 live_stats 能看到。
         if (liveRecordPath.Length > 0)
@@ -2837,10 +2938,12 @@ internal static class CuHelper
                 double sealMs = 0;
                 if (due || onDemand)
                 {
+                    // 只入队：Finish+Dispose（实测 176 ms）由封片线程做，采集线程立刻继续下一帧。
                     double s0 = timer == null ? 0 : Now();
-                    SealH264Segment(encoder, segmentStart, lastFrameAt, inSegment);
+                    EnqueueH264Seal(encoder, segmentStart, lastFrameAt, inSegment);
                     if (timer != null) sealMs = (Now() - s0) * 1000.0;
                     encoder = null;
+                    // 收下这个按需结算请求：不清它下一帧又会切一片（取帧方改等 inFlight 归零）。
                     h264FlushRequested = false;
                 }
 
@@ -2885,6 +2988,15 @@ internal static class CuHelper
                 try { pendingThread.Join(3000); }
                 catch (ThreadStateException) { Console.Error.WriteLine("h264 预建线程没能启动，跳过等待"); }
                 pendingThread = null;
+            }
+            // 停封片线程：它会把队列里剩下的片封完再退出（退出条件是"队列空且采集已停"），
+            // 所以这里的等待是等最后几片进环，不是空等。
+            h264SealWorkerRunning = false;
+            if (h264SealWorker != null)
+            {
+                try { h264SealWorker.Join(5000); }
+                catch (ThreadStateException) { Console.Error.WriteLine("h264 封片线程没能启动，跳过等待"); }
+                h264SealWorker = null;
             }
             MemoryEncoder leftover;
             lock (pendingLock) { leftover = pending; pending = null; }

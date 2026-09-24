@@ -106,6 +106,16 @@ loads and all 16 tools register. The same symbols are also present in `@deepseek
   must not act at the same time, or their actions interleave.
 - Capture runs at the rate fixed by `frameIntervalMs` (40 fps in the shipped patch) and costs roughly a quarter of
   one core while active. The rate is a deployment choice, not a tool argument: `screen_watch` has no `fps` parameter.
+- **The per-frame interval bound is not fully met.** The target is that no frame interval exceeds **33.333 ms**
+  (`frameIntervalMs: 25`). Measured at 2560×1440 / h264 / dxgi under a full-screen animation load with a second
+  helper recording alongside: **4–5 frames out of ~2400 exceed it** (35–37 ms, so 99.8% within bound). Every one of
+  those frames is the one where the **next encoder is pre-built** — roughly 220 ms of Media Foundation work running
+  concurrently with capture; it is not a capture or encode throughput limit. Sealing (`Finish`+`Dispose`, 176 ms
+  under load) was moved off the capture thread, which took the once-per-segment boundary misses from 9 frames to 0.
+  Closing the remainder needs the encoder not to be rebuilt per segment (a continuous writer with logical segments),
+  which is **not implemented**. A resident pre-build thread with the capture thread at `AboveNormal` and background
+  work at `BelowNormal` only moved the same stall to a different frame (118 instead of 100) and made the worst case
+  worse (55.9 ms vs 37.6 ms), so it was **not adopted**. Numbers and conditions: `helper/README.md`.
 - H.264 segments are lossy (PSNR 44.8–50 dB); it does not affect reading small text, but it is not lossless.
 - The helper must be recompiled with the Windows-shipped `csc.exe` if you change `helper/*.cs`; the build command is
   in `helper/README.md`.
