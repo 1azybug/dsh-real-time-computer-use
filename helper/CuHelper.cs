@@ -1503,6 +1503,16 @@ internal static class CuHelper
     /// （1 秒窗口约 30 帧、约 3 秒完成，这才是取逐帧时刻表的常规用法）。</summary>
     private const int H264DecodeBudget = 512;
 
+    /// <summary>从切片解出来交给调用方的帧（`h264-*.jpg`）在磁盘上保留多少个。
+    /// **必须显著大于单次请求的最大落盘量（H264DecodeBudget = 512）**：一次请求可能解出几百帧，
+    /// 而清理发生在**同一次请求的末尾**——上限若小于落盘量，这次请求自己写入的早期帧会被自己删掉，
+    /// 调用方紧接着读文件就报 ENOENT（2026-09-25 评测实测：窗口大于约 6.4 秒的取帧必然命中，
+    /// C28/C39 两轮共 16 次失败；相邻两次失败的 seq 差恰为 512 = 单次落盘量）。
+    /// 2048 帧 ≈ 180 MB（每帧约 90 KB），磁盘代价可忽略；保留本批的兜底见 PruneTakenFrames。
+    /// 2026-09-25 主人要求再开大：**16384 帧 ≈ 1.4 GB ≈ 262 秒**的已解码帧。注意这项**不是可回看时长**——
+    /// 能看到多久以前由内存环形缓冲（retain_s / 字节预算）决定，这里只管"解出来的 jpg 在磁盘上留几张"。</summary>
+    private const int TakenFramesKept = 16384;
+
     private static int h264TakenSeq;
 
     /// <summary>预建编码器由后台线程写、采集线程读，用锁保证可见性。</summary>
@@ -1601,6 +1611,9 @@ internal static class CuHelper
 
         StringBuilder body = new StringBuilder();
         int written = 0;
+        // 本批写入的路径：清理时一个都不能删——调用方马上要读它们（见 TakenFramesKept 的说明）。
+        System.Collections.Generic.HashSet<string> taken =
+            new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
         for (int s = 0; s < slices.Count; s++)
         {
             H264Slice slice = slices[s];
@@ -1637,6 +1650,7 @@ internal static class CuHelper
                         h264TakenSeq++;
                         string path = Path.Combine(outDir, "h264-" + h264TakenSeq + ".jpg");
                         SaveFrame(decoded.Bitmap, path, false, liveQuality);
+                        taken.Add(path);
                         if (written > 0) body.Append(',');
                         body.Append("{\"ok\":true,\"seq\":").Append(h264TakenSeq)
                             .Append(",\"t\":").Append(F(at))
@@ -1654,24 +1668,31 @@ internal static class CuHelper
             }
             finally { if (decoder != null) decoder.Dispose(); }
         }
-        PruneTakenFrames();
+        PruneTakenFrames(taken);
         return "{\"ok\":true,\"count\":" + written + ",\"decoded\":" + written
             + ",\"segments\":" + slices.Count + ",\"frames\":[" + body + "]}";
     }
 
     /// <summary>取帧会不断落盘 JPEG（每帧约 100–300 KB），按写入时间淘汰旧的、只留最近的一批。
-    /// 逐帧 JPEG 采集的帧由 PruneOldFrames 管；这里管的是"从切片解出来交给调用方的帧"。</summary>
-    private static void PruneTakenFrames()
+    /// 逐帧 JPEG 采集的帧由 PruneOldFrames 管；这里管的是"从切片解出来交给调用方的帧"。
+    /// `keep` 是本批刚写入、调用方马上要读的文件——即使它们排在最旧那一段也**不能删**。</summary>
+    private static void PruneTakenFrames(System.Collections.Generic.HashSet<string> keep)
     {
         try
         {
             string[] files = Directory.GetFiles(outDir, "h264-*.jpg");
-            if (files.Length <= 400) return;
+            if (files.Length <= TakenFramesKept) return;
             Array.Sort(files, delegate(string a, string b)
             {
                 return File.GetLastWriteTimeUtc(a).CompareTo(File.GetLastWriteTimeUtc(b));
             });
-            for (int i = 0; i < files.Length - 400; i++) File.Delete(files[i]);
+            int removable = files.Length - TakenFramesKept;
+            for (int i = 0; i < files.Length && removable > 0; i++)
+            {
+                if (keep != null && keep.Contains(files[i])) continue;
+                File.Delete(files[i]);
+                removable--;
+            }
         }
         catch (IOException ex) { Console.Error.WriteLine("h264 frames: 清理旧帧失败：{0}", ex.Message); }
         catch (UnauthorizedAccessException ex) { Console.Error.WriteLine("h264 frames: 清理旧帧失败：{0}", ex.Message); }
